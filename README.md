@@ -12,15 +12,20 @@ npm run db:migrate
 npm run dev
 ```
 
-**http://localhost:8787** を開いて `Create Binder`。表示された編集画面で `Copy Edit URL` を押し、URLを保管してください。復元はできません。`Copy Share URL` は閲覧専用です。
+**http://localhost:8787** を開いて `Create Binder`。タイトル横の **Shareは閲覧用URLだけ**をコピーします。編集用URLはその他メニュー（`Binder options`）の `Copy edit URL` からコピーして保管してください。復元はできません。
 
-- フォルダー名を押すと開き、パンくずで戻ります。
-- 編集画面で項目のラジオボタンを選び、`Rename` / `Move` / `Delete` を操作します。
-- リンクのURLは `Rename` のフォームで変更できます。
-- `Move up` / `Move down` で同じ階層内の順序を保存します。
-- フォームはその場に表示されます。削除には確認操作が必要です。
-- Tab / Shift+Tab、Enter / Space、ラジオボタンの矢印キー、フォーム内のEscapeを使えます。
+- URLを入力欄に貼り付けてEnter。ホスト名を初期タイトルとして追加し、入力欄が空になったら続けて追加できます。外部メタデータは取得しません。
+- `New Folder` は一覧内に名前入力行を作ります。Enterで保存、Escapeでキャンセル。FolderのRenameも同じ行内入力です。
+- フォルダー名を押すと開き、パンくずで戻ります。ブラウザーの戻る・進むにも対応します。
+- 各行のその他メニューから `Rename` / `Edit`（Linkのみ）/ `Move` / `Delete` を選びます。右クリック、Shift+F10、コンテキストメニューキーでも同じメニューを開けます。タッチ用ボタンは常時表示します。
+- Linkの `Rename` は名前のみ、`Edit` は名前とURLを編集します。Moveは同じ行で移動先を選択します。
+- 項目メニューの `Move up` / `Move down` で順序を保存します。ドラッグは不要で、タッチ・キーボードでも並べ替えできます。
+- メニューは上下矢印・Home・Endで移動し、Escapeで閉じます。行内フォームもEscapeでキャンセルできます。
+- 残り時間はタイトル横に表示し、押すと削除予定日時が分かります。`Delete Binder` はその他メニュー内にあり、項目削除・Binder削除とも確認が必要です。
+- 保存中は操作を無効化し、失敗時は入力を保持します。フィードバックは操作場所の近くに表示し、成功表示は約3.5秒で消えます。
 - ThemeはSystemが初期値です。Light / Darkも選べ、テーマのみlocalStorageへ保存します。
+
+閲覧・編集で共通の一覧とナビゲーションを使い、閲覧画面では作成・編集・削除操作を表示しません。Folder移動で再構築するのはパンくずと一覧だけで、タイトルやURL入力欄のDOMは保持します。保存後はAPIの応答を一覧へ反映し、全画面の再取得は行いません。API・D1スキーマ・認証・168時間の有効期限・CronはUI再設計前から変更していません。
 
 `npm run dev` はViteでビルド後、WranglerのローカルWorkerからフロントエンドとAPIを同一オリジンで配信します。フロントエンド変更後は別ターミナルで `npm run build` を実行し、ブラウザーを再読み込みしてください。Workerの変更はWranglerが検知します。
 
@@ -34,7 +39,8 @@ src/
   types.ts                    API / UI共通のデータ型
 web/
   index.html                  ページの共通シェル
-  main.ts                     Vanilla TypeScriptのファイルマネージャー
+  main.ts                     ファイルマネージャーの状態・行内編集・部分更新
+  ui.ts                       共通DOM、SVGアイコン、キーボード対応メニュー
   style.css                   レスポンシブ、System / Light / Dark
   public/_headers             Static Assetsのセキュリティヘッダー
 migrations/
@@ -134,14 +140,18 @@ npx wrangler deploy --dry-run --outdir /tmp/binder-worker-dryrun
 
 VitestはCloudflare公式プラグインで**ローカルworkerdとD1**を動かし、実マイグレーションを適用します。DBのモックは使いません。各テスト前の消去は独立したテストDBだけが対象で、開発用 `.wrangler/state/` には触れません。
 
-初期実装の検証結果：
+UI再設計後の検証結果：
 
 - **20テスト成功**：作成、3階層Folder、Link作成・編集、移動、循環 / 異なるBinder / Link親の拒否、Node・配下一括・Binder削除、全更新APIのトークン検証、他Binderのトークン拒否、並び替え・不正な集合の拒否、期限直前 / ちょうど期限、期限後の各更新拒否、処理中の期限超過、Cron、期限不変、不正URL7パターン、入力制限、同時作成での上限検証など。
-- TypeScript・Viteビルド・Wrangler dry-run成功。
+- TypeScript・Viteビルド成功。バックエンド・依存パッケージの変更なし。
 - `npm audit`：開発依存を含め **0 vulnerabilities**（実行時点）。
-- 既存Chromeでブラウザーフロー成功。作成、入れ子、XSS文字列のテキスト表示、名前 / URL編集、実際のClipboard内容、閲覧専用UI、無効トークン、移動、並べ替え、削除、保存失敗時の入力保持、保存後の再取得失敗とRetry、テーマ追従・永続化を確認。
-- 390×844 / 1280×800で画面確認。390px幅で横方向のオーバーフローなし。
-- ローカルDBの**検証専用Binder**を15秒後の期限に設定し、実時間で一覧非表示とAPI 404を確認。Cronを呼び、対象行が0件になることを確認。
+- 既存Chromeでブラウザーフロー成功。URLだけでの連続追加、3階層Folder、行内作成・Rename、名前 / URL編集、移動、上下並べ替え、確認付き削除、XSS文字列のテキスト表示を確認。
+- 右クリック、Shift+F10、矢印・End・Escapeによるメニュー操作、戻る・進む、ナビゲーション中のヘッダー・URL入力DOM保持を検証。
+- Folder作成・URL追加・Renameの503失敗で入力が残り、再試行できることを確認。無効URL・無効トークン、閲覧専用UIも検証。
+- 実際のClipboard内容がShareでは閲覧URL、明示的な編集URLコピーでは編集URLになることを確認。Clipboard失敗時も編集トークンをDOMへ描画しません。
+- 375×812 / 1280×800で、トップ・空状態・複数項目・多階層・Light / Darkを画面確認。375pxの編集フォームと長い名前でも横方向のオーバーフローなし。テーマ追従・永続化を確認。
+- UI編集の前後で `expires_at` が不変であることと、ブラウザー時計を進めたとき期限後の一覧が消えることを検証。実D1でのAPI期限拒否・Cron削除は20件の統合テストに含まれます。
+- 配色の計算値：補助文字はLightで5.57:1、Darkで7.99:1。入力境界はそれぞれ3.11:1、3.29:1。
 
 ### ブラウザーフローの再実行
 
@@ -154,7 +164,7 @@ node "$PW" run-code "$(node --input-type=module -e 'import { run } from "./tests
 node "$PW" close
 ```
 
-通常の `playwright-cli` がある場合は、`node "$PW"` 部分を `playwright-cli` に置き換えてください。`tests/browser.mjs` はテスト用Binderを新規作成し、最後にそのBinderを削除します。スクリーンショットは `/tmp/binder-mobile.png` と `/tmp/binder-desktop.png` です。テスト中の想定内401 / 404 / 503はブラウザーコンソールに記録されることがありますが、未処理JavaScript例外はありません。
+通常の `playwright-cli` がある場合は、`node "$PW"` 部分を `playwright-cli` に置き換えてください。`tests/browser.mjs` はテスト用Binderを新規作成し、最後にそのBinderを削除します。スクリーンショットは `/tmp/binder-redesign-*.png`（home / empty / desktop / nested / mobile / mobile-menu / mobile-edit）です。項目メニューは標準のPopover APIを使用するため、現行のChrome / Safari / Firefox等を対象とします。テスト中の想定内401 / 404 / 503はブラウザーコンソールに記録されることがありますが、未処理JavaScript例外はありません。
 
 ### 期限切れを手元で確認
 
