@@ -3,11 +3,14 @@ import { HTTPException } from 'hono/http-exception';
 import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import type { Binder, BinderNode } from './types';
+import { enrichNode } from './enrichment';
 
 type Bindings = { DB: D1Database; ASSETS: Fetcher };
 type Variables = { binder: Binder & { edit_token_hash: string } };
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const columns = 'id, title, created_at, expires_at, updated_at';
+const nodeColumns = `id, binder_id, parent_id, type, title, url, sort_order, created_at, updated_at, metadata_status,
+  CASE WHEN favicon IS NULL THEN NULL ELSE '/api/binders/' || binder_id || '/nodes/' || id || '/favicon?v=' || metadata_version END AS favicon_url`;
 function fail(status: 400 | 401 | 404 | 409 | 413 | 415 | 429, message: string): never {
   throw new HTTPException(status, { message });
 }
@@ -17,6 +20,12 @@ async function hash(token: string) {
   return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
 }
 
+app.use('/api/binders/:id/nodes/:nodeId/favicon', async (c, next) => {
+  await next();
+  // Run after secureHeaders so SVG documents remain sandboxed, including direct navigation.
+  c.header('Content-Security-Policy', "default-src 'none'; sandbox");
+  c.header('Cross-Origin-Resource-Policy', 'same-origin');
+});
 app.use('*', secureHeaders({
   referrerPolicy: 'no-referrer',
   contentSecurityPolicy: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'"],
@@ -95,13 +104,22 @@ app.get('/api/binders/:id', async c => {
   const id = c.get('binder').id;
   const result = await c.env.DB.batch([
     c.env.DB.prepare(`SELECT ${columns} FROM binders WHERE id = ? AND expires_at > ?`).bind(id, Date.now()),
-    c.env.DB.prepare('SELECT * FROM nodes WHERE binder_id = ? ORDER BY sort_order, id').bind(id),
+    c.env.DB.prepare(`SELECT ${nodeColumns} FROM nodes WHERE binder_id = ? ORDER BY sort_order, id`).bind(id),
   ]);
   const binder = result[0].results[0] as unknown as Binder | undefined;
   if (!binder || binder.expires_at <= Date.now()) fail(404, 'Binder not found or expired');
   return c.json({ ...binder, nodes: result[1].results as unknown as BinderNode[] });
 });
 app.get('/api/binders/:id/access', c => c.json({ editable: true }));
+app.get('/api/binders/:id/nodes/:nodeId/favicon', async c => {
+  const row = await c.env.DB.prepare('SELECT favicon, favicon_type FROM nodes WHERE id = ? AND binder_id = ?')
+    .bind(c.req.param('nodeId'), c.get('binder').id).first<{ favicon: number[] | null; favicon_type: string | null }>();
+  const remaining = Math.floor((c.get('binder').expires_at - Date.now()) / 1000);
+  if (!row?.favicon || !row.favicon_type || remaining <= 0) fail(404, 'Item not found');
+  c.header('Content-Type', row.favicon_type);
+  c.header('Cache-Control', `private, max-age=${Math.min(3600, remaining)}`);
+  return c.body(Uint8Array.from(row.favicon));
+});
 
 app.delete('/api/binders/:id', async c => {
   const result = await c.env.DB.prepare("DELETE FROM binders WHERE id = ? AND expires_at > max(?, unixepoch('subsec') * 1000) RETURNING id")
@@ -114,13 +132,16 @@ app.post('/api/binders/:id/nodes', async c => {
   fields(data, ['type', 'title', 'url', 'parent_id']);
   if (data.type !== 'folder' && data.type !== 'link') fail(400, 'Choose folder or link');
   if (data.type === 'folder' && data.url !== undefined) fail(400, 'Folders cannot have a URL');
-  const name = title(data.title), href = data.type === 'link' ? url(data.url) : null;
+  const href = data.type === 'link' ? url(data.url) : null;
+  const name = href && data.title === undefined ? new URL(href).hostname.slice(0, 200) : title(data.title);
   const parentId = parent(data.parent_id ?? null), binderId = c.get('binder').id, now = Date.now();
-  const node = await c.env.DB.prepare(`INSERT INTO nodes
-    (id, binder_id, parent_id, type, title, url, sort_order, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, (SELECT coalesce(max(sort_order), -1) + 1 FROM nodes WHERE binder_id = ? AND parent_id IS ?), ?, ?) RETURNING *`)
-    .bind(random(16), binderId, parentId, data.type, name, href, binderId, parentId, now, now).first<BinderNode>();
-  return c.json(node, 201);
+  const row = await c.env.DB.prepare(`INSERT INTO nodes
+    (id, binder_id, parent_id, type, title, url, sort_order, created_at, updated_at, title_is_manual, metadata_status, metadata_version)
+    VALUES (?, ?, ?, ?, ?, ?, (SELECT coalesce(max(sort_order), -1) + 1 FROM nodes WHERE binder_id = ? AND parent_id IS ?), ?, ?, ?, ?, ?) RETURNING ${nodeColumns}`)
+    .bind(random(16), binderId, parentId, data.type, name, href, binderId, parentId, now, now,
+      data.title === undefined && href ? 0 : 1, href ? 'pending' : 'none', href ? 1 : 0).first<BinderNode>();
+  if (href && row) c.executionCtx.waitUntil(enrichNode(c.env.DB, binderId, row.id, href, 1, new URL(c.req.url).origin));
+  return c.json(row, 201);
 });
 app.patch('/api/binders/:id/nodes/:nodeId', async c => {
   const data = await json(c);
@@ -128,12 +149,18 @@ app.patch('/api/binders/:id/nodes/:nodeId', async c => {
   if (!Object.keys(data).length) fail(400, 'No changes supplied');
   const binderId = c.get('binder').id, nodeId = c.req.param('nodeId');
   const sets: string[] = [], values: (string | number | null)[] = [];
-  if ('title' in data) { sets.push('title = ?'); values.push(title(data.title)); }
+  let changedUrl: string | null = null;
+  if ('title' in data) { sets.push('title = ?', 'title_is_manual = 1'); values.push(title(data.title)); }
   if ('url' in data) {
-    const node = await c.env.DB.prepare('SELECT type FROM nodes WHERE id = ? AND binder_id = ?').bind(nodeId, binderId).first();
+    const node = await c.env.DB.prepare('SELECT type, url FROM nodes WHERE id = ? AND binder_id = ?').bind(nodeId, binderId).first();
     if (!node) fail(404, 'Item not found');
     if (node.type !== 'link') fail(400, 'Folders cannot have a URL');
-    sets.push('url = ?'); values.push(url(data.url));
+    const href = url(data.url);
+    sets.push('url = ?'); values.push(href);
+    if (href !== node.url) {
+      changedUrl = href;
+      sets.push("metadata_status = 'pending'", 'metadata_version = metadata_version + 1', 'favicon = NULL', 'favicon_type = NULL', 'title_is_manual = 1');
+    }
   }
   if ('parent_id' in data) {
     const parentId = parent(data.parent_id);
@@ -141,9 +168,11 @@ app.patch('/api/binders/:id/nodes/:nodeId', async c => {
     values.push(parentId, binderId, parentId);
   }
   sets.push('updated_at = ?'); values.push(Date.now(), nodeId, binderId);
-  const node = await c.env.DB.prepare(`UPDATE nodes SET ${sets.join(', ')} WHERE id = ? AND binder_id = ? RETURNING *`)
-    .bind(...values).first<BinderNode>();
-  if (!node) fail(404, 'Item not found');
+  const row = await c.env.DB.prepare(`UPDATE nodes SET ${sets.join(', ')} WHERE id = ? AND binder_id = ? RETURNING ${nodeColumns}, metadata_version`)
+    .bind(...values).first<BinderNode & { metadata_version: number }>();
+  if (!row) fail(404, 'Item not found');
+  const { metadata_version, ...node } = row;
+  if (changedUrl) c.executionCtx.waitUntil(enrichNode(c.env.DB, binderId, nodeId, changedUrl, metadata_version, new URL(c.req.url).origin));
   return c.json(node);
 });
 app.delete('/api/binders/:id/nodes/:nodeId', async c => {

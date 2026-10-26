@@ -13,6 +13,8 @@ export interface BinderNode {
   title: string;
   url: string | null;
   sort_order: number;
+  metadata_status?: 'none' | 'pending' | 'ready' | 'failed';
+  favicon_url?: string | null;
   created_at: number;
   updated_at: number;
 }

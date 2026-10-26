@@ -174,7 +174,7 @@ test('guards deletion at SQL execution time even when expiry follows request-tim
 
 test('database constraints reject a link with a null URL', async () => {
   const b = await create(), now = Date.now();
-  await expect(env.DB.prepare("INSERT INTO nodes VALUES (?, ?, NULL, 'link', 'Invalid', NULL, 0, ?, ?)")
+  await expect(env.DB.prepare("INSERT INTO nodes (id,binder_id,parent_id,type,title,url,sort_order,created_at,updated_at) VALUES (?, ?, NULL, 'link', 'Invalid', NULL, 0, ?, ?)")
     .bind('a'.repeat(32), b.id, now, now).run()).rejects.toThrow();
 });
 
@@ -188,7 +188,7 @@ test('a valid token from another Binder cannot change or delete this Binder’s 
 test('enforces node and anonymous creation capacity, including concurrent inserts', async () => {
   const b = await create();
   const now = Date.now();
-  await env.DB.batch(Array.from({ length: 199 }, (_, i) => env.DB.prepare("INSERT INTO nodes VALUES (?, ?, NULL, 'folder', 'Fixture', NULL, ?, ?, ?)").bind(i.toString(16).padStart(32, '0'), b.id, i, now, now)));
+  await env.DB.batch(Array.from({ length: 199 }, (_, i) => env.DB.prepare("INSERT INTO nodes (id,binder_id,parent_id,type,title,url,sort_order,created_at,updated_at) VALUES (?, ?, NULL, 'folder', 'Fixture', NULL, ?, ?, ?)").bind(i.toString(16).padStart(32, '0'), b.id, i, now, now)));
   const results = await Promise.all([1, 2].map(() => request(`/binders/${b.id}/nodes`, 'POST', { type: 'folder', title: 'Last' }, b.edit_token)));
   expect(results.map(r => r.status).sort()).toEqual([201, 409]);
   for (let i = 0; i < 19; i++) await create();

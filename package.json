@@ -12,6 +12,7 @@
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
+    "entities": "^8.1.0",
     "hono": "^4.13.14"
   },
   "devDependencies": {

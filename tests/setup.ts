@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { applyD1Migrations, type D1Migration } from 'cloudflare:test';
-import { beforeAll, beforeEach } from 'vitest';
+import { beforeAll, beforeEach, afterEach, vi } from 'vitest';
 
 declare global {
   namespace Cloudflare {
@@ -10,4 +10,8 @@ declare global {
 }
 
 beforeAll(async () => { await applyD1Migrations(env.DB, env.TEST_MIGRATIONS); });
-beforeEach(async () => { await env.DB.prepare('DELETE FROM binders').run(); });
+beforeEach(async () => {
+  await env.DB.prepare('DELETE FROM binders').run();
+  vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('External requests disabled in tests'));
+});
+afterEach(() => vi.restoreAllMocks());
