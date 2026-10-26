@@ -1,5 +1,6 @@
 import './style.css';
-import { element, button, icon, iconButton, showMenu, closeMenu } from './ui';
+import { element, button, icon, iconButton, showMenu, closeMenu, localizeInput } from './ui';
+import { apiErrorMessage, remainingTime } from './locale';
 import type { BinderData, BinderNode } from '../src/types';
 
 const app = document.querySelector<HTMLElement>('#app')!;
@@ -23,10 +24,10 @@ async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> 
     headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       ...(editing && token ? { Authorization: `Bearer ${token}` } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  }).catch(() => { throw new Error('通信できませんでした。接続を確認して、もう一度お試しください。'); });
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Request failed. Try again.' })) as { error: string };
-    throw new ApiError(error.error || 'Request failed. Try again.', response.status);
+    const error = await response.json().catch(() => null) as { error?: unknown } | null;
+    throw new ApiError(apiErrorMessage(error?.error, response.status), response.status);
   }
   return (response.status === 204 ? undefined : await response.json()) as T;
 }
@@ -46,14 +47,14 @@ async function perform(task: () => Promise<void>, target: HTMLElement) {
   const controls = Array.from(app.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>('button, input, select'));
   const disabled = controls.map(node => node.disabled);
   controls.forEach(node => { node.disabled = true; });
-  feedback(target, 'Saving…');
+  feedback(target, '保存中…');
   try { await task(); return true; }
   catch (error) {
     const destination = target.isConnected ? target : shell?.notice;
     if (destination) {
-      feedback(destination, error instanceof Error ? error.message : 'Could not save. Try again.', true);
+      feedback(destination, error instanceof Error ? error.message : '保存できませんでした。もう一度お試しください。', true);
       if (error instanceof ApiError && [404, 409].includes(error.status)) {
-        destination.append(button('Reload', () => void initialize(), 'text-button'));
+        destination.append(button('再読み込み', () => void initialize(), 'text-button'));
       }
     }
     return false;
@@ -136,13 +137,13 @@ async function copy(edit: boolean) {
   const value = `${location.origin}/b/${id}${edit ? '/edit#' + token : ''}`;
   try {
     await navigator.clipboard.writeText(value);
-    if (shell) feedback(shell.shareNotice, edit ? 'Edit URL copied. Keep it private.' : 'Share URL copied.');
+    if (shell) feedback(shell.shareNotice, edit ? '編集用URLをコピーしました。他の人に渡さないでください。' : '共有URLをコピーしました。');
   } catch {
     if (!shell) return;
-    if (edit) feedback(shell.shareNotice, 'Clipboard unavailable. Copy the edit URL from your address bar and keep it private.', true);
+    if (edit) feedback(shell.shareNotice, 'コピーできませんでした。アドレスバーから編集用URLをコピーし、他の人に渡さないでください。', true);
     else {
-      feedback(shell.shareNotice, 'Copy this share URL:', true);
-      const input = element('input'); input.value = value; input.readOnly = true; input.setAttribute('aria-label', 'Share URL');
+      feedback(shell.shareNotice, '共有URLを手動でコピーしてください。', true);
+      const input = element('input'); input.value = value; input.readOnly = true; input.setAttribute('aria-label', '共有URL');
       shell.shareNotice.append(input); input.focus(); input.select();
     }
   }
@@ -151,14 +152,14 @@ function itemMenu(node: BinderNode, trigger: HTMLButtonElement, point?: { x: num
   if (busy || !editable) return;
   const items = siblings(), index = items.findIndex(item => item.id === node.id);
   showMenu(trigger, [
-    { label: 'Rename', action: () => openEditor('rename', node) },
-    ...(node.type === 'link' ? [{ label: 'Edit', action: () => openEditor('edit', node) }] : []),
-    { label: 'Move', action: () => openEditor('move', node) },
+    { label: '名前を変更', action: () => openEditor('rename', node) },
+    ...(node.type === 'link' ? [{ label: '編集', action: () => openEditor('edit', node) }] : []),
+    { label: '移動', action: () => openEditor('move', node) },
     null,
-    { label: 'Move up', disabled: index <= 0, action: () => void reorder(node, -1) },
-    { label: 'Move down', disabled: index >= items.length - 1, action: () => void reorder(node, 1) },
+    { label: '上へ移動', disabled: index <= 0, action: () => void reorder(node, -1) },
+    { label: '下へ移動', disabled: index >= items.length - 1, action: () => void reorder(node, 1) },
     null,
-    { label: 'Delete', danger: true, action: () => openEditor('delete', node) },
+    { label: '削除', danger: true, action: () => openEditor('delete', node) },
   ], point);
 }
 async function reorder(node: BinderNode, direction: -1 | 1) {
@@ -169,26 +170,27 @@ async function reorder(node: BinderNode, direction: -1 | 1) {
     await api(`${endpoint}/reorder`, 'PUT', { parent_id: currentFolder(), ids: items.map(item => item.id) });
     items.forEach((item, order) => { item.sort_order = order; });
   }, shell!.notice)) {
-    renderRows(); focusRow(node.id); feedback(shell!.notice, 'Order updated.');
+    renderRows(); focusRow(node.id); feedback(shell!.notice, '並び順を変更しました。');
   }
 }
 function field(form: HTMLElement, label: string, value: string, type = 'text') {
   const wrapper = element('label', label), input = element('input');
   input.type = type; input.value = value; input.required = true; input.autocomplete = 'off';
   input.maxLength = type === 'url' ? 2048 : 200;
+  localizeInput(input, label);
   wrapper.append(input); form.append(wrapper); return input;
 }
 function editor() {
   const current = mode!;
   const form = element('form', undefined, `row-editor ${current.kind === 'folder' || current.kind === 'rename' ? 'inline-name' : ''}`);
-  form.setAttribute('aria-label', current.kind === 'folder' ? 'New folder' : 'Edit item');
+  form.setAttribute('aria-label', current.kind === 'folder' ? 'フォルダーを作成' : '項目を編集');
   const error = notice();
-  const cancelButton = button('Cancel', cancel, 'cancel-button');
+  const cancelButton = button('キャンセル', cancel, 'cancel-button');
   if (current.kind === 'delete' || current.kind === 'delete-binder') {
     form.classList.add('delete-confirm');
-    form.append(element('p', current.kind === 'delete-binder' ? 'Delete this Binder and everything in it? This cannot be undone.' :
-      `Delete “${current.node!.title}”${current.node!.type === 'folder' ? ' and everything inside it' : ''}? This cannot be undone.`));
-    form.append(cancelButton, button('Delete permanently', () => void (async () => {
+    form.append(element('p', current.kind === 'delete-binder' ? 'このBinderと中の項目をすべて削除しますか？この操作は取り消せません。' :
+      `「${current.node!.title}」${current.node!.type === 'folder' ? 'と中の項目をすべて' : 'を'}削除しますか？この操作は取り消せません。`));
+    form.append(cancelButton, button('削除する', () => void (async () => {
       if (await perform(async () => {
         await api(current.kind === 'delete-binder' ? endpoint : `${endpoint}/nodes/${current.node!.id}`, 'DELETE');
         if (current.kind !== 'delete-binder') {
@@ -196,13 +198,13 @@ function editor() {
         }
       }, error)) {
         if (current.kind === 'delete-binder') { token = ''; location.replace('/'); return; }
-        mode = null; renderRows(); shell?.url.focus(); feedback(shell!.notice, 'Item deleted.');
+        mode = null; renderRows(); shell?.url.focus(); feedback(shell!.notice, '項目を削除しました。');
       }
     })(), 'danger-button'));
   } else {
     let name: HTMLInputElement | undefined, url: HTMLInputElement | undefined, destination: HTMLSelectElement | undefined;
     if (current.kind === 'move') {
-      const label = element('label', 'Destination'); destination = element('select'); destination.setAttribute('aria-label', 'Destination');
+      const label = element('label', '移動先'); destination = element('select'); destination.setAttribute('aria-label', '移動先');
       const root = element('option', data!.title); root.value = ''; destination.append(root);
       const excluded = subtree(current.node!.id);
       for (const folder of data!.nodes.filter(node => node.type === 'folder' && !excluded.has(node.id))) {
@@ -210,11 +212,11 @@ function editor() {
       }
       destination.value = current.node!.parent_id ?? ''; label.append(destination); form.append(label);
     } else {
-      name = field(form, current.kind === 'edit' ? 'Name' : current.node?.type === 'link' ? 'Link name' : 'Folder name', current.node?.title ?? '');
+      name = field(form, current.kind === 'edit' ? '名前' : current.node?.type === 'link' ? 'リンク名' : 'フォルダー名', current.node?.title ?? '');
       if (current.kind !== 'edit') name.parentElement!.classList.add('name-field');
       if (current.kind === 'edit') url = field(form, 'URL', current.node!.url!, 'url');
     }
-    const save = element('button', current.kind === 'move' ? 'Move here' : 'Save', 'primary'); save.type = 'submit';
+    const save = element('button', current.kind === 'move' ? 'ここに移動' : '保存', 'primary'); save.type = 'submit';
     form.append(save, cancelButton);
     form.onsubmit = event => {
       event.preventDefault();
@@ -229,7 +231,7 @@ function editor() {
           upsert(saved);
         }, error)) {
           mode = null; renderRows(); focusRow(current.kind === 'move' ? undefined : saved!.id);
-          feedback(shell!.notice, current.kind === 'folder' ? 'Folder created.' : current.kind === 'move' ? 'Item moved.' : 'Changes saved.');
+          feedback(shell!.notice, current.kind === 'folder' ? 'フォルダーを作成しました。' : current.kind === 'move' ? '項目を移動しました。' : '変更を保存しました。');
         } else name?.focus();
       })();
     };
@@ -261,7 +263,7 @@ function renderRows() {
     }
     row.append(content);
     if (editable) {
-      const trigger = iconButton(`Actions for ${node.title}`, 'more', () => itemMenu(node, trigger)); trigger.classList.add('item-trigger');
+      const trigger = iconButton(`「${node.title}」の操作`, 'more', () => itemMenu(node, trigger)); trigger.classList.add('item-trigger');
       trigger.setAttribute('aria-haspopup', 'menu'); trigger.setAttribute('aria-expanded', 'false'); row.append(trigger);
       row.oncontextmenu = event => { event.preventDefault(); itemMenu(node, trigger, { x: event.clientX, y: event.clientY }); };
       row.onkeydown = event => {
@@ -271,7 +273,7 @@ function renderRows() {
     if (mode?.node?.id === node.id) row.append(editor());
     shell.list.append(row);
   }
-  if (!shell.list.children.length) shell.list.append(element('li', editable ? 'No links yet. Paste a URL above, or add a folder.' : 'This folder is empty.', 'empty'));
+  if (!shell.list.children.length) shell.list.append(element('li', editable ? 'URLを貼り付けるか、フォルダーを作成してください。' : 'このフォルダーは空です。', 'empty'));
 }
 function renderLocation() {
   if (!shell || !data) return;
@@ -289,28 +291,31 @@ function mountBinder() {
   const identity = element('div', undefined, 'binder-identity');
   identity.append(element('h1', data!.title));
   const expiry = element('details', undefined, 'expiry'), countdown = element('summary', '', 'countdown');
-  const absolute = element('time', `Deletes ${new Date(data!.expires_at).toLocaleString()}`);
+  const absolute = element('time', `削除予定：${new Date(data!.expires_at).toLocaleString('ja-JP', {
+    year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+  })}`);
   absolute.dateTime = new Date(data!.expires_at).toISOString(); expiry.append(countdown, absolute); identity.append(expiry);
   const sharing = element('div', undefined, 'sharing');
-  sharing.append(button('Share', () => void copy(false), 'primary'));
+  sharing.append(button('共有', () => void copy(false), 'primary'));
   if (editable) {
-    const options = iconButton('Binder options', 'more', () => showMenu(options, [
-      { label: 'Copy edit URL', action: () => void copy(true) }, null,
-      { label: 'Delete Binder', danger: true, action: () => openEditor('delete-binder') },
+    const options = iconButton('Binderのその他の操作', 'more', () => showMenu(options, [
+      { label: '編集用URLをコピー', action: () => void copy(true) }, null,
+      { label: 'Binderを削除', danger: true, action: () => openEditor('delete-binder') },
     ]));
     options.setAttribute('aria-haspopup', 'menu'); options.setAttribute('aria-expanded', 'false'); sharing.append(options);
   }
   header.append(identity, sharing);
   const shareNotice = notice(); shareNotice.classList.add('share-feedback'); header.append(shareNotice);
-  const breadcrumbs = element('nav', undefined, 'breadcrumbs'); breadcrumbs.setAttribute('aria-label', 'Folders');
+  const breadcrumbs = element('nav', undefined, 'breadcrumbs'); breadcrumbs.setAttribute('aria-label', 'フォルダーの階層');
   const panel = element('div', undefined, 'binder-panel');
   const composer = element('div', undefined, 'composer');
   const addForm = element('form', undefined, 'url-form'), url = element('input');
-  url.type = 'url'; url.placeholder = 'Paste a URL to add a link'; url.setAttribute('aria-label', 'Add a link');
+  url.type = 'url'; url.placeholder = 'URLを貼り付けてリンクを追加'; url.setAttribute('aria-label', 'リンクを追加');
   url.required = true; url.maxLength = 2048; url.autocomplete = 'off'; url.spellcheck = false;
-  const add = element('button', 'Add link'); add.type = 'submit';
+  localizeInput(url, 'URL');
+  const add = element('button', '追加'); add.type = 'submit';
   addForm.append(url, add);
-  const newFolder = button('New Folder', () => openEditor('folder'), 'new-folder');
+  const newFolder = button('新しいフォルダー', () => openEditor('folder'), 'new-folder');
   const composerNotice = notice();
   addForm.onsubmit = event => {
     event.preventDefault();
@@ -319,17 +324,17 @@ function mountBinder() {
     try {
       parsed = new URL(value);
       if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error();
-    } catch { feedback(composerNotice, 'Use an http or https URL without credentials.', true); url.focus(); return; }
+    } catch { feedback(composerNotice, 'httpまたはhttpsで始まる、ユーザー名・パスワードを含まないURLを入力してください。', true); url.focus(); return; }
     const body = { type: 'link', title: parsed.hostname.slice(0, 200), url: value, parent_id: currentFolder() };
     void (async () => {
       if (await perform(async () => { upsert(await api<BinderNode>(`${endpoint}/nodes`, 'POST', body)); }, composerNotice)) {
-        url.value = ''; renderRows(); feedback(composerNotice, 'Link added.');
+        url.value = ''; renderRows(); feedback(composerNotice, 'リンクを追加しました。');
       }
       url.focus();
     })();
   };
   composer.append(addForm, newFolder);
-  const list = element('ul', undefined, 'node-list'); list.setAttribute('aria-label', 'Folder contents');
+  const list = element('ul', undefined, 'node-list'); list.setAttribute('aria-label', 'フォルダー内の項目');
   list.classList.toggle('view-only', !editable);
   app.replaceChildren(header, breadcrumbs, panel);
   if (editable) app.append(composer);
@@ -338,52 +343,50 @@ function mountBinder() {
 }
 function unavailable(message: string) {
   shell = null; mode = null; closeMenu();
-  const section = element('section', undefined, 'unavailable'); section.append(element('h1', 'Binder unavailable'));
+  const section = element('section', undefined, 'unavailable'); section.append(element('h1', 'Binderを開けません'));
   const error = notice(); feedback(error, message, true); section.append(error);
-  section.append(button('Retry', () => void initialize()));
-  const home = element('a', 'Create a new Binder', 'text-button'); home.href = '/'; section.append(home); app.replaceChildren(section);
+  section.append(button('再試行', () => void initialize()));
+  const home = element('a', '新しいBinderを作成', 'text-button'); home.href = '/'; section.append(home); app.replaceChildren(section);
 }
 function updateExpiry() {
   if (!data || !shell) return;
   const remaining = data.expires_at - Date.now();
-  if (remaining <= 0) { data = null; editable = false; unavailable('Binder expired. Its links are no longer available.'); return; }
-  const hours = Math.floor(remaining / 3600000);
-  shell.countdown.textContent = hours >= 24 ? `Expires in ${Math.floor(hours / 24)}d ${hours % 24}h` :
-    `Expires in ${hours}h ${Math.floor(remaining / 60000) % 60}m`;
+  if (remaining <= 0) { data = null; editable = false; unavailable('有効期限が切れたため、このBinderのリンクは表示できません。'); return; }
+  shell.countdown.textContent = remainingTime(remaining);
 }
 async function initialize() {
   const version = ++loadVersion;
   mode = null; editable = false; closeMenu(); shell = null;
-  app.setAttribute('aria-busy', 'true'); app.replaceChildren(element('p', 'Loading Binder…', 'loading'));
+  app.setAttribute('aria-busy', 'true'); app.replaceChildren(element('p', 'Binderを読み込み中…', 'loading'));
   try {
     const loaded = await api<BinderData>(endpoint);
     let accessError = '';
     if (editing) {
       try { await api(`${endpoint}/access`); }
-      catch (error) { accessError = error instanceof Error ? error.message : 'Could not verify editing access. Reload to retry.'; }
+      catch (error) { accessError = error instanceof Error ? error.message : '編集権限を確認できませんでした。再読み込みしてお試しください。'; }
     }
     if (version !== loadVersion) return;
     data = loaded; editable = editing && !accessError;
     shell = mountBinder(); renderLocation(); updateExpiry();
     if (accessError && shell) {
       feedback(shell.notice, accessError, true);
-      shell.notice.append(button('Retry', () => void initialize(), 'text-button'));
+      shell.notice.append(button('再試行', () => void initialize(), 'text-button'));
     }
   } catch (error) {
-    if (version === loadVersion) { data = null; unavailable(error instanceof Error ? error.message : 'Could not load Binder. Check your connection and retry.'); }
+    if (version === loadVersion) { data = null; unavailable(error instanceof Error ? error.message : 'Binderを読み込めませんでした。接続を確認してお試しください。'); }
   } finally { if (version === loadVersion) app.setAttribute('aria-busy', 'false'); }
 }
 function landing() {
   const section = element('section', undefined, 'landing');
-  section.append(element('h1', 'A temporary place for links.'), element('p', 'Collect links in folders. Share one URL.', 'muted'));
+  section.append(element('h1', 'リンクをまとめて、一時的に共有。'), element('p', 'フォルダーに整理して、ひとつのURLで渡せます。', 'muted'));
   const message = notice();
-  section.append(button('Create Binder', () => void (async () => {
+  section.append(button('Binderを作成', () => void (async () => {
     await perform(async () => {
       const binder = await api<{ id: string; edit_token: string }>('/api/binders', 'POST', {});
       location.assign(`/b/${binder.id}/edit#${binder.edit_token}`);
     }, message);
   })(), 'primary'));
-  section.append(element('p', 'No account. Deleted after 7 days.', 'footnote'), message); app.replaceChildren(section);
+  section.append(element('p', 'アカウント不要。作成から7日後に自動削除されます。', 'footnote'), message); app.replaceChildren(section);
   app.setAttribute('aria-busy', 'false');
 }
 window.addEventListener('popstate', () => { if (shell) navigate(currentFolder(), false); });
@@ -392,4 +395,4 @@ window.addEventListener('resize', () => closeMenu());
 setInterval(updateExpiry, 1000);
 if (id) void initialize();
 else if (location.pathname === '/') landing();
-else { app.replaceChildren(element('h1', 'Page not found')); app.setAttribute('aria-busy', 'false'); }
+else { app.replaceChildren(element('h1', 'ページが見つかりません')); app.setAttribute('aria-busy', 'false'); }

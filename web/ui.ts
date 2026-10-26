@@ -9,6 +9,20 @@ export function button(text: string, action: () => void, className = '') {
   node.type = 'button'; node.onclick = action;
   return node;
 }
+export function localizeInput(input: HTMLInputElement, label: string) {
+  input.addEventListener('invalid', () => {
+    if (input.validity.valueMissing) input.setCustomValidity(`${label}を入力してください。`);
+    else if (input.validity.typeMismatch) input.setCustomValidity('httpまたはhttpsで始まるURLを入力してください。');
+  });
+  input.addEventListener('input', () => input.setCustomValidity(''));
+  input.addEventListener('keydown', event => {
+    // Safari can report keyCode 229 after composition has already ended.
+    if ((event.isComposing || event.keyCode === 229) && ['Enter', 'Escape'].includes(event.key)) {
+      event.stopPropagation();
+      if (event.key === 'Enter') event.preventDefault();
+    }
+  });
+}
 export function icon(kind: 'folder' | 'link' | 'more') {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('viewBox', '0 0 20 20');
@@ -43,7 +57,7 @@ export function closeMenu(restoreFocus = false) {
 export function showMenu(trigger: HTMLElement, actions: (MenuAction | null)[], point?: { x: number; y: number }) {
   closeMenu();
   const menu = element('div', undefined, 'context-menu');
-  menu.popover = 'auto'; menu.setAttribute('role', 'menu'); menu.setAttribute('aria-label', 'Actions');
+  menu.popover = 'auto'; menu.setAttribute('role', 'menu'); menu.setAttribute('aria-label', '操作メニュー');
   for (const item of actions) {
     if (!item) { menu.append(element('hr')); continue; }
     const entry = button(item.label, () => { closeMenu(); item.action(); }, item.danger ? 'danger-text' : '');
