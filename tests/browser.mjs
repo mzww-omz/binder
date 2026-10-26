@@ -21,7 +21,12 @@ export async function run(page) {
   await page.goto(editURL);
   await page.getByRole('button', { name: 'New Folder', exact: true }).click();
   await page.getByLabel('Name', { exact: true }).fill('Research');
+  await page.route('**/api/binders/*', async route => {
+    await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Reload test failure' }) });
+  }, { times: 1 });
   await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('heading', { name: 'Binder unavailable', exact: true }).waitFor({ timeout: 5000 });
+  await page.getByRole('button', { name: 'Retry', exact: true }).click();
   await page.getByRole('button', { name: 'Research', exact: true }).click();
   await page.getByRole('button', { name: 'New Folder', exact: true }).click();
   await page.getByLabel('Name', { exact: true }).fill('Sources');

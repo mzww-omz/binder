@@ -102,7 +102,10 @@ function folderPath(node: BinderNode) {
   }
   return 'Binder / ' + parts.join(' / ');
 }
-async function reload() { data = await api<BinderData>(endpoint); }
+async function reload() {
+  try { data = await api<BinderData>(endpoint); }
+  catch (error) { data = null; throw error; }
+}
 async function copy(edit: boolean) {
   const value = `${location.origin}/b/${id}${edit ? '/edit#' + token : ''}`;
   try { await navigator.clipboard.writeText(value); announce(edit ? 'Edit URL copied. Keep it private; it cannot be recovered.' : 'Share URL copied.'); }
