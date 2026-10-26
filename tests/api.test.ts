@@ -117,6 +117,10 @@ test('expiry is exclusive at the exact millisecond, forbids read and every edit,
   expect((await request(`/binders/${b.id}`)).status).toBe(404);
   expect((await request(`/binders/${b.id}`, 'DELETE', undefined, b.edit_token)).status).toBe(404);
   expect((await request(`/binders/${b.id}/nodes`, 'POST', { type: 'folder', title: 'Late' }, b.edit_token)).status).toBe(404);
+  const node = (await env.DB.prepare('SELECT id FROM nodes WHERE binder_id = ?').bind(b.id).first<{ id: string }>())!;
+  expect((await request(`/binders/${b.id}/nodes/${node.id}`, 'PATCH', { title: 'Late' }, b.edit_token)).status).toBe(404);
+  expect((await request(`/binders/${b.id}/nodes/${node.id}`, 'DELETE', undefined, b.edit_token)).status).toBe(404);
+  expect((await request(`/binders/${b.id}/reorder`, 'PUT', { parent_id: null, ids: [node.id] }, b.edit_token)).status).toBe(404);
   const live = await create();
   const ctx = createExecutionContext();
   await worker.scheduled(createScheduledController(), env as never, ctx);
@@ -154,6 +158,31 @@ test('handles hostile titles as data, validates input lengths, unknown fields an
   const raw = await exports.default.fetch('https://binder.test/api/binders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{' });
   expect(raw.status).toBe(400);
   expect((await request('/binders', 'POST')).status).toBe(415);
+});
+
+test('guards deletion at SQL execution time even when expiry follows request-time validation', async () => {
+  const b = await create(), node = await add(b);
+  const expires = Date.now() - 1;
+  await env.DB.prepare('UPDATE binders SET created_at = ?, expires_at = ? WHERE id = ?').bind(expires - 604800000, expires, b.id).run();
+  vi.spyOn(Date, 'now').mockReturnValue(expires - 100);
+  try {
+    expect((await request(`/binders/${b.id}/nodes/${node.id}`, 'DELETE', undefined, b.edit_token)).status).toBe(404);
+    expect((await request(`/binders/${b.id}`, 'DELETE', undefined, b.edit_token)).status).toBe(404);
+    expect(await env.DB.prepare('SELECT id FROM nodes WHERE id = ?').bind(node.id).first()).not.toBeNull();
+  } finally { vi.restoreAllMocks(); }
+});
+
+test('database constraints reject a link with a null URL', async () => {
+  const b = await create(), now = Date.now();
+  await expect(env.DB.prepare("INSERT INTO nodes VALUES (?, ?, NULL, 'link', 'Invalid', NULL, 0, ?, ?)")
+    .bind('a'.repeat(32), b.id, now, now).run()).rejects.toThrow();
+});
+
+test('a valid token from another Binder cannot change or delete this Binder’s nodes', async () => {
+  const b = await create(), other = await create(), node = await add(b);
+  expect((await request(`/binders/${b.id}/nodes/${node.id}`, 'DELETE', undefined, other.edit_token)).status).toBe(401);
+  expect((await request(`/binders/${other.id}/nodes/${node.id}`, 'PATCH', { title: 'Denied' }, other.edit_token)).status).toBe(404);
+  expect((await request(`/binders/${other.id}/nodes/${node.id}`, 'DELETE', undefined, other.edit_token)).status).toBe(404);
 });
 
 test('enforces node and anonymous creation capacity, including concurrent inserts', async () => {

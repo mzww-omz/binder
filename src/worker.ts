@@ -88,6 +88,7 @@ app.use('/api/binders/:id/*', async (c, next) => {
     for (let i = 0; i < 64; i++) difference |= actual.charCodeAt(i) ^ binder.edit_token_hash.charCodeAt(i);
     if (difference) fail(401, 'Invalid edit token');
   }
+  if (binder.expires_at <= Date.now()) fail(404, 'Binder not found or expired');
   await next();
 });
 app.get('/api/binders/:id', async c => {
@@ -103,7 +104,7 @@ app.get('/api/binders/:id', async c => {
 app.get('/api/binders/:id/access', c => c.json({ editable: true }));
 
 app.delete('/api/binders/:id', async c => {
-  const result = await c.env.DB.prepare('DELETE FROM binders WHERE id = ? AND expires_at > ? RETURNING id')
+  const result = await c.env.DB.prepare("DELETE FROM binders WHERE id = ? AND expires_at > max(?, unixepoch('subsec') * 1000) RETURNING id")
     .bind(c.get('binder').id, Date.now()).all();
   if (!result.results.length) fail(404, 'Binder not found or expired');
   return c.body(null, 204);
@@ -147,7 +148,7 @@ app.patch('/api/binders/:id/nodes/:nodeId', async c => {
 });
 app.delete('/api/binders/:id/nodes/:nodeId', async c => {
   const result = await c.env.DB.prepare(`DELETE FROM nodes WHERE id = ? AND binder_id = ?
-    AND EXISTS (SELECT 1 FROM binders WHERE id = ? AND expires_at > ?) RETURNING id`)
+    AND EXISTS (SELECT 1 FROM binders WHERE id = ? AND expires_at > max(?, unixepoch('subsec') * 1000)) RETURNING id`)
     .bind(c.req.param('nodeId'), c.get('binder').id, c.get('binder').id, Date.now()).all();
   if (!result.results.length) fail(404, 'Item not found or Binder expired');
   return c.body(null, 204);
@@ -182,7 +183,7 @@ app.onError((error, c) => {
   if (/binder_capacity/.test(message)) return c.json({ error: 'Creation limit reached. Please try later.' }, 429);
   if (/node_capacity/.test(message)) return c.json({ error: 'A Binder can hold up to 200 items' }, 409);
   if (/binder_expired/.test(message)) return c.json({ error: 'Binder not found or expired' }, 404);
-  if (/invalid_parent|folder_cycle|immutable_node|CHECK constraint/.test(message)) return c.json({ error: 'Invalid item or destination' }, 400);
+  if (/invalid_parent|invalid_node|folder_cycle|immutable_node|CHECK constraint/.test(message)) return c.json({ error: 'Invalid item or destination' }, 400);
   return c.json({ error: 'Unable to save. Please try again.' }, 500);
 });
 app.notFound(c => c.json({ error: 'Not found' }, 404));

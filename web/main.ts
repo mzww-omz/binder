@@ -166,6 +166,7 @@ function renderForm() {
       };
       void operation(async () => {
         await api(current.node ? `${endpoint}/nodes/${current.node.id}` : `${endpoint}/nodes`, current.node ? 'PATCH' : 'POST', body);
+        if (current.kind === 'move') selected = null;
         form = null; await reload(); announce('Saved.');
       });
     };
