@@ -1,0 +1,80 @@
+// Self-contained for Playwright CLI's run-code; see README.
+export async function run(page) {
+  const assert = {
+    equal(actual, expected, message = 'Unexpected value') {
+      if (actual !== expected) throw new Error(`${message}: ${actual} !== ${expected}`);
+    },
+    deepEqual(actual, expected, message) { this.equal(JSON.stringify(actual), JSON.stringify(expected), message); },
+  };
+  const origin = 'http://localhost:8787';
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto(origin);
+  await page.getByRole('button', { name: 'Create Binder', exact: true }).click({ timeout: 5000 });
+  await page.waitForURL(/\/edit#[a-f0-9]{64}$/);
+  const editURL = page.url();
+  const shareURL = editURL.split('/edit#')[0];
+  await page.getByRole('button', { name: 'New Folder', exact: true }).click();
+  await page.getByLabel('Name', { exact: true }).fill('Research');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('button', { name: 'Research', exact: true }).click();
+  await page.getByRole('button', { name: 'New Folder', exact: true }).click();
+  await page.getByLabel('Name', { exact: true }).fill('Sources');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('button', { name: 'Sources', exact: true }).click();
+  await page.getByRole('button', { name: 'New Link', exact: true }).click();
+  await page.getByLabel('Name', { exact: true }).fill('<img src=x onerror=alert(1)>');
+  await page.getByLabel('URL', { exact: true }).fill('https://example.com/');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('link', { name: '<img src=x onerror=alert(1)>', exact: true }).waitFor();
+  assert.equal(await page.locator('#app img').count(), 0, 'title must not become markup');
+  await page.getByRole('radio').check();
+  await page.getByRole('button', { name: 'Rename', exact: true }).click();
+  await page.getByLabel('Name', { exact: true }).fill('Documentation');
+  await page.getByLabel('URL', { exact: true }).fill('https://example.org/docs');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('link', { name: 'Documentation', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Copy Share URL', exact: true }).click();
+  await page.getByRole('button', { name: 'Copy Edit URL', exact: true }).click();
+  await page.getByLabel('Theme', { exact: true }).selectOption('dark');
+  assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
+  await page.reload();
+  await page.getByRole('button', { name: 'New Folder', exact: true }).waitFor();
+  assert.equal(await page.getByLabel('Theme', { exact: true }).inputValue(), 'dark');
+  await page.goto(shareURL);
+  await page.getByRole('button', { name: 'Research', exact: true }).click();
+  await page.getByRole('button', { name: 'Sources', exact: true }).click();
+  const link = page.getByRole('link', { name: 'Documentation', exact: true });
+  await link.waitFor();
+  assert.equal(await link.getAttribute('href'), 'https://example.org/docs');
+  assert.equal(await link.getAttribute('rel'), 'noopener noreferrer');
+  assert.equal(await page.getByRole('button', { name: 'New Folder', exact: true }).count(), 0);
+  assert.equal(await page.getByRole('button', { name: 'Delete Binder', exact: true }).count(), 0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await page.screenshot({ path: '/tmp/binder-mobile.png', fullPage: true });
+  await page.goto(editURL);
+  await page.getByRole('button', { name: 'Research', exact: true }).click();
+  await page.getByRole('radio').check();
+  await page.getByRole('button', { name: 'Move', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Destination', exact: true }).selectOption('');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.getByRole('navigation', { name: 'Folders' }).getByRole('button', { name: 'Binder', exact: true }).click();
+  await page.getByRole('button', { name: 'Sources', exact: true }).waitFor();
+  await page.getByRole('radio', { name: 'Select Sources', exact: true }).check();
+  await page.getByRole('button', { name: 'Move up', exact: true }).click();
+  await page.getByRole('button', { name: 'Sources', exact: true }).waitFor();
+  await page.getByRole('radio', { name: 'Select Research', exact: true }).check();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await page.getByRole('button', { name: 'Delete permanently', exact: true }).click();
+  await page.getByRole('button', { name: 'Research', exact: true }).waitFor({ state: 'detached' });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.screenshot({ path: '/tmp/binder-desktop.png', fullPage: true });
+  await page.getByRole('button', { name: 'Delete Binder', exact: true }).click();
+  await page.getByRole('button', { name: 'Delete permanently', exact: true }).click();
+  await page.waitForURL(origin + '/');
+  await page.goto(editURL.replace(/#[^#]+$/, '#' + '0'.repeat(64)));
+  await page.getByText('Binder not found or expired', { exact: true }).waitFor();
+  assert.deepEqual(errors, [], 'no browser exceptions');
+  console.log('Browser flow passed: create, nested folders, link/XSS, rename, copy, theme, public view, mobile, move, reorder, delete.');
+}
