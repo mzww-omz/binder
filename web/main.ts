@@ -46,6 +46,7 @@ async function perform(task: () => Promise<void>, target: HTMLElement) {
   const controls = Array.from(app.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>('button, input, select'));
   const disabled = controls.map(node => node.disabled);
   controls.forEach(node => { node.disabled = true; });
+  feedback(target, 'Saving…');
   try { await task(); return true; }
   catch (error) {
     const destination = target.isConnected ? target : shell?.notice;
@@ -254,7 +255,9 @@ function renderRows() {
     name.append(icon(node.type), element('span', node.title, 'node-name'));
     content.append(name);
     if (node.type === 'link') {
-      const domain = element('span', new URL(node.url!).hostname, 'node-domain'); domain.title = node.url!; content.append(domain);
+      const parsed = new URL(node.url!);
+      const detail = node.title === parsed.hostname ? parsed.pathname : parsed.hostname;
+      const domain = element('span', detail, 'node-domain'); domain.title = node.url!; content.append(domain);
     }
     row.append(content);
     if (editable) {
@@ -298,7 +301,7 @@ function mountBinder() {
     options.setAttribute('aria-haspopup', 'menu'); options.setAttribute('aria-expanded', 'false'); sharing.append(options);
   }
   header.append(identity, sharing);
-  const shareNotice = notice(); shareNotice.classList.add('share-feedback');
+  const shareNotice = notice(); shareNotice.classList.add('share-feedback'); header.append(shareNotice);
   const breadcrumbs = element('nav', undefined, 'breadcrumbs'); breadcrumbs.setAttribute('aria-label', 'Folders');
   const panel = element('div', undefined, 'binder-panel');
   const composer = element('div', undefined, 'composer');
@@ -326,11 +329,12 @@ function mountBinder() {
     })();
   };
   composer.append(addForm, newFolder);
-  const listNotice = notice(), list = element('ul', undefined, 'node-list'); list.setAttribute('aria-label', 'Folder contents');
-  app.replaceChildren(header, shareNotice, breadcrumbs, panel);
-  if (editable) app.append(composer, composerNotice);
-  app.append(listNotice, list);
-  return { header, countdown, shareNotice, breadcrumbs, panel, url, newFolder, notice: listNotice, list };
+  const list = element('ul', undefined, 'node-list'); list.setAttribute('aria-label', 'Folder contents');
+  list.classList.toggle('view-only', !editable);
+  app.replaceChildren(header, breadcrumbs, panel);
+  if (editable) app.append(composer);
+  app.append(composerNotice, list);
+  return { header, countdown, shareNotice, breadcrumbs, panel, url, newFolder, notice: composerNotice, list };
 }
 function unavailable(message: string) {
   shell = null; mode = null; closeMenu();
@@ -361,7 +365,10 @@ async function initialize() {
     if (version !== loadVersion) return;
     data = loaded; editable = editing && !accessError;
     shell = mountBinder(); renderLocation(); updateExpiry();
-    if (accessError && shell) feedback(shell.notice, accessError, true);
+    if (accessError && shell) {
+      feedback(shell.notice, accessError, true);
+      shell.notice.append(button('Retry', () => void initialize(), 'text-button'));
+    }
   } catch (error) {
     if (version === loadVersion) { data = null; unavailable(error instanceof Error ? error.message : 'Could not load Binder. Check your connection and retry.'); }
   } finally { if (version === loadVersion) app.setAttribute('aria-busy', 'false'); }

@@ -4,6 +4,7 @@ export async function run(page) {
     if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${message}: ${JSON.stringify(actual)} !== ${JSON.stringify(expected)}`);
   };
   const origin = 'http://localhost:8787';
+  await page.clock.setSystemTime(new Date());
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
@@ -47,7 +48,20 @@ export async function run(page) {
   await page.getByRole('textbox', { name: 'Folder name', exact: true }).press('Escape');
   equal(await page.getByRole('textbox', { name: 'Folder name', exact: true }).count(), 0);
   equal((await (await page.request.get(apiURL)).json()).nodes.length, 0, 'cancel must not create a folder');
-  await newFolder('Projects');
+  await page.getByRole('button', { name: 'New Folder', exact: true }).click();
+  const draft = page.getByRole('textbox', { name: 'Folder name', exact: true });
+  await draft.fill('Projects');
+  await page.route('**/api/binders/*/nodes', route => route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"Folder test failure"}' }), { times: 1 });
+  await draft.press('Enter'); await page.getByText('Folder test failure', { exact: true }).waitFor();
+  equal(await draft.inputValue(), 'Projects', 'failed creation retains draft');
+  await draft.press('Enter'); await folder('Projects').waitFor();
+  const urlInput = page.getByRole('textbox', { name: 'Add a link', exact: true });
+  await urlInput.fill('javascript:alert(1)'); await urlInput.press('Enter');
+  await page.getByText('Use an http or https URL without credentials.', { exact: true }).waitFor();
+  await urlInput.fill('https://example.com/notes');
+  await page.route('**/api/binders/*/nodes', route => route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"Link test failure"}' }), { times: 1 });
+  await urlInput.press('Enter'); await page.getByText('Link test failure', { exact: true }).waitFor();
+  equal(await urlInput.inputValue(), 'https://example.com/notes', 'failed addition retains URL');
   await addLink('https://example.com/notes', 'example.com');
   await addLink('https://developers.cloudflare.com/d1/', 'developers.cloudflare.com');
   await page.getByRole('button', { name: 'Share', exact: true }).click();
@@ -59,6 +73,20 @@ export async function run(page) {
   await page.getByText('Edit URL copied. Keep it private.', { exact: true }).waitFor();
   equal(await page.evaluate(() => navigator.clipboard.readText()), editURL);
   equal(await page.locator('body').innerText().then(text => text.includes(secret)), false, 'secret must not be rendered');
+  await page.getByText('Edit URL copied. Keep it private.', { exact: true }).waitFor({ state: 'detached', timeout: 6000 });
+  await page.evaluate(() => {
+    window.originalClipboardWrite = navigator.clipboard.writeText;
+    navigator.clipboard.writeText = async () => { throw new Error('Clipboard test failure'); };
+  });
+  await page.getByRole('button', { name: 'Binder options', exact: true }).click();
+  await page.getByRole('menuitem', { name: 'Copy edit URL', exact: true }).click();
+  await page.getByText('Clipboard unavailable. Copy the edit URL from your address bar and keep it private.', { exact: true }).waitFor();
+  equal(await page.locator('input').evaluateAll((inputs, token) => inputs.some(input => input.value.includes(token)), secret), false, 'clipboard failure must not render the edit token');
+  await page.getByRole('button', { name: 'Share', exact: true }).click();
+  equal(await page.getByRole('textbox', { name: 'Share URL', exact: true }).inputValue(), shareURL);
+  await page.evaluate(() => { navigator.clipboard.writeText = window.originalClipboardWrite; });
+  await page.getByRole('button', { name: 'Share', exact: true }).click();
+  await page.getByText('Share URL copied.', { exact: true }).waitFor();
 
   await choose('Projects', 'Rename');
   const rename = page.getByRole('textbox', { name: 'Folder name', exact: true });
@@ -70,7 +98,9 @@ export async function run(page) {
   await rename.press('Enter'); await folder('Research').waitFor();
   const heading = await page.locator('.binder-header').elementHandle();
   const composer = await page.getByRole('textbox', { name: 'Add a link', exact: true }).elementHandle();
+  await urlInput.fill('https://pending.example/');
   await folder('Research').click();
+  equal(await urlInput.inputValue(), 'https://pending.example/', 'navigation preserves the composer draft');
   await newFolder('References'); await folder('References').click();
   await newFolder('Sources'); await folder('Sources').click();
   equal(await heading.evaluate(el => el.isConnected), true, 'navigation preserves the header');
@@ -109,6 +139,8 @@ export async function run(page) {
   await page.keyboard.press('Escape');
   await actions('example.com').focus(); await page.keyboard.press('Shift+F10');
   await page.getByRole('menuitem', { name: 'Rename', exact: true }).waitFor();
+  await page.keyboard.press('ArrowDown');
+  equal(await page.getByRole('menuitem', { name: 'Edit', exact: true }).evaluate(el => el === document.activeElement), true);
   await page.keyboard.press('End');
   equal(await page.getByRole('menuitem', { name: 'Delete', exact: true }).evaluate(el => el === document.activeElement), true);
   await page.keyboard.press('Escape');
@@ -116,6 +148,7 @@ export async function run(page) {
   await page.screenshot({ path: '/tmp/binder-redesign-desktop.png', fullPage: true });
 
   await page.setViewportSize({ width: 375, height: 812 });
+  equal(await page.locator('.site-header').count(), 1);
   await page.getByLabel('Theme', { exact: true }).selectOption('dark');
   await page.screenshot({ path: '/tmp/binder-redesign-mobile.png', fullPage: true });
   await actions('developers.cloudflare.com').click();
@@ -124,6 +157,8 @@ export async function run(page) {
   equal(menuBounds.x >= 0 && menuBounds.x + menuBounds.width <= 375, true, 'menu stays inside viewport');
   await page.getByRole('menuitem', { name: 'Edit', exact: true }).click();
   await page.getByLabel('Name', { exact: true }).fill('A very long link name '.repeat(8));
+  equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'mobile editor has no horizontal overflow');
+  await page.screenshot({ path: '/tmp/binder-redesign-mobile-edit.png', fullPage: true });
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await list.getByRole('link', { name: /^A very long link name/ }).waitFor();
   equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, '375px has no horizontal overflow');
@@ -160,5 +195,19 @@ export async function run(page) {
   await page.getByRole('button', { name: 'Delete permanently', exact: true }).click();
   await page.waitForURL(origin + '/');
   equal((await page.request.get(apiURL)).status(), 404);
+  const fixtureResponse = await page.request.post(`${origin}/api/binders`, { data: {} });
+  equal(fixtureResponse.status(), 201);
+  const fixture = await fixtureResponse.json();
+  try {
+    await page.clock.install({ time: new Date(fixture.expires_at - 1000) });
+    await page.goto(`${origin}/b/${fixture.id}`);
+    await page.getByRole('heading', { name: 'Binder', exact: true }).waitFor();
+    await page.clock.fastForward(1500);
+    await page.getByRole('heading', { name: 'Binder unavailable', exact: true }).waitFor();
+    await page.getByText('Binder expired. Its links are no longer available.', { exact: true }).waitFor();
+    equal(await page.getByRole('list', { name: 'Folder contents', exact: true }).count(), 0);
+  } finally {
+    await page.request.delete(`${origin}/api/binders/${fixture.id}`, { headers: { Authorization: `Bearer ${fixture.edit_token}` } });
+  }
   equal(errors, [], 'no unhandled browser exceptions');
 }
