@@ -1,48 +1,22 @@
 import './style.css';
+import { element, button, icon, iconButton, showMenu, closeMenu } from './ui';
 import type { BinderData, BinderNode } from '../src/types';
 
 const app = document.querySelector<HTMLElement>('#app')!;
-const status = document.querySelector<HTMLElement>('#status')!;
 const theme = document.querySelector<HTMLSelectElement>('#theme')!;
-let data: BinderData | null = null;
-let selected: string | null = null;
-let busy = false;
-let editable = false;
-let form: { kind: 'folder' | 'link' | 'rename' | 'move' | 'delete' | 'delete-binder'; node?: BinderNode } | null = null;
 const route = location.pathname.match(/^\/b\/([a-f0-9]{32})(\/edit)?$/);
-const id = route?.[1];
-const editing = !!route?.[2];
-let token = editing ? location.hash.slice(1) : '';
+const id = route?.[1], editing = !!route?.[2];
 const endpoint = `/api/binders/${id}`;
+let token = editing ? location.hash.slice(1) : '';
+let data: BinderData | null = null;
+let editable = false, busy = false, loadVersion = 0;
+let mode: { kind: 'folder' | 'rename' | 'edit' | 'move' | 'delete' | 'delete-binder'; node?: BinderNode } | null = null;
+let shell: ReturnType<typeof mountBinder> | null = null;
+const timers = new WeakMap<HTMLElement, ReturnType<typeof setTimeout>>();
 
-function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string, className?: string) {
-  const node = document.createElement(tag);
-  if (text !== undefined) node.textContent = text;
-  if (className) node.className = className;
-  return node;
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
 }
-function announce(message: string, error = false) {
-  status.textContent = message;
-  status.setAttribute('role', error ? 'alert' : 'status');
-  status.classList.toggle('error', error);
-}
-function button(text: string, action: () => void, disabled = false, className = '') {
-  const b = element('button', text, className);
-  b.type = 'button'; b.disabled = busy || disabled; b.onclick = action;
-  return b;
-}
-function applyTheme() {
-  const value = theme.value;
-  document.documentElement.dataset.theme = value;
-  try { localStorage.setItem('binder-theme', value); } catch { /* Storage can be unavailable in private browsers. */ }
-}
-try {
-  const stored = localStorage.getItem('binder-theme');
-  if (stored && ['system', 'light', 'dark'].includes(stored)) theme.value = stored;
-} catch { /* System remains the default. */ }
-applyTheme();
-theme.onchange = applyTheme;
-
 async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
   const response = await fetch(path, {
     method, cache: 'no-store', credentials: 'omit',
@@ -51,253 +25,364 @@ async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> 
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Request failed' })) as { error: string };
-    if (response.status === 404 && id) {
-      data = null; editable = false; render();
-    }
-    throw new Error(error.error || 'Request failed');
+    const error = await response.json().catch(() => ({ error: 'Request failed. Try again.' })) as { error: string };
+    throw new ApiError(error.error || 'Request failed. Try again.', response.status);
   }
   return (response.status === 204 ? undefined : await response.json()) as T;
 }
-async function operation(task: () => Promise<void>) {
-  if (busy) return;
-  busy = true;
-  let failed = false;
-  app.setAttribute('aria-busy', 'true');
+function feedback(target: HTMLElement, text: string, error = false) {
+  clearTimeout(timers.get(target));
+  target.replaceChildren(element('span', text)); target.hidden = false;
+  target.classList.toggle('error', error); target.setAttribute('role', error ? 'alert' : 'status');
+  if (!error) timers.set(target, setTimeout(() => { target.replaceChildren(); target.hidden = true; }, 3500));
+}
+function notice() {
+  const node = element('div', undefined, 'feedback'); node.setAttribute('role', 'status'); node.hidden = true;
+  return node;
+}
+async function perform(task: () => Promise<void>, target: HTMLElement) {
+  if (busy) return false;
+  busy = true; closeMenu(); app.setAttribute('aria-busy', 'true');
   const controls = Array.from(app.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>('button, input, select'));
-  const disabled = controls.map(n => n.disabled);
-  controls.forEach(n => { n.disabled = true; });
-  try { await task(); }
-  catch (error) { failed = true; announce(error instanceof Error ? error.message : 'Could not save. Try again.', true); }
-  finally {
-    busy = false;
-    app.setAttribute('aria-busy', 'false');
-    // Preserve unsaved input on failure; successful saves restore contextual controls.
-    if (failed && data) controls.forEach((n, i) => { n.disabled = disabled[i]; });
-    else { render(); app.querySelector<HTMLElement>('.toolbar button, .landing button')?.focus(); }
+  const disabled = controls.map(node => node.disabled);
+  controls.forEach(node => { node.disabled = true; });
+  try { await task(); return true; }
+  catch (error) {
+    const destination = target.isConnected ? target : shell?.notice;
+    if (destination) {
+      feedback(destination, error instanceof Error ? error.message : 'Could not save. Try again.', true);
+      if (error instanceof ApiError && [404, 409].includes(error.status)) {
+        destination.append(button('Reload', () => void initialize(), 'text-button'));
+      }
+    }
+    return false;
+  } finally {
+    busy = false; app.setAttribute('aria-busy', 'false');
+    controls.forEach((node, index) => { if (node.isConnected) node.disabled = disabled[index]; });
   }
 }
+function applyTheme() {
+  document.documentElement.dataset.theme = theme.value;
+  try { localStorage.setItem('binder-theme', theme.value); } catch { /* Storage may be unavailable. */ }
+}
+try {
+  const value = localStorage.getItem('binder-theme');
+  if (value && ['system', 'light', 'dark'].includes(value)) theme.value = value;
+} catch { /* System remains the default. */ }
+applyTheme(); theme.onchange = applyTheme;
+
 function currentFolder() {
   const folder = new URLSearchParams(location.search).get('folder');
-  return data?.nodes.some(n => n.id === folder && n.type === 'folder') ? folder! : null;
+  return data?.nodes.some(node => node.id === folder && node.type === 'folder') ? folder! : null;
 }
-function navigate(folder: string | null) {
-  const next = new URL(location.href);
-  if (folder) next.searchParams.set('folder', folder); else next.searchParams.delete('folder');
-  history.pushState(null, '', next);
-  selected = null; form = null; render();
+function siblings() {
+  return data!.nodes.filter(node => node.parent_id === currentFolder())
+    .sort((a, b) => a.sort_order - b.sort_order || a.id.localeCompare(b.id));
 }
-function siblings() { return data!.nodes.filter(n => n.parent_id === currentFolder()); }
-function showForm(kind: NonNullable<typeof form>['kind'], node?: BinderNode) {
-  form = { kind, node }; render();
-  app.querySelector<HTMLElement>('.inline-form input, .inline-form select, .inline-form button')?.focus();
+function upsert(node: BinderNode) {
+  const index = data!.nodes.findIndex(item => item.id === node.id);
+  if (index < 0) data!.nodes.push(node); else data!.nodes[index] = node;
+}
+function subtree(id: string) {
+  const ids = new Set([id]);
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const node of data!.nodes) if (node.parent_id && ids.has(node.parent_id) && !ids.has(node.id)) {
+      ids.add(node.id); changed = true;
+    }
+  }
+  return ids;
 }
 function folderPath(node: BinderNode) {
-  const parts = [node.title];
-  let parentId = node.parent_id;
-  while (parentId) {
-    const p = data!.nodes.find(n => n.id === parentId);
-    if (!p) break;
-    parts.unshift(p.title); parentId = p.parent_id;
+  const names = [node.title];
+  let parent = node.parent_id;
+  while (parent) {
+    const ancestor = data!.nodes.find(item => item.id === parent);
+    if (!ancestor) break;
+    names.unshift(ancestor.title); parent = ancestor.parent_id;
   }
-  return 'Binder / ' + parts.join(' / ');
+  return `${data!.title} / ${names.join(' / ')}`;
 }
-async function reload() {
-  try { data = await api<BinderData>(endpoint); }
-  catch (error) { data = null; throw error; }
+function navigate(folder: string | null, push = true) {
+  if (!data) return;
+  closeMenu(); mode = null;
+  if (push) {
+    const next = new URL(location.href);
+    if (folder) next.searchParams.set('folder', folder); else next.searchParams.delete('folder');
+    history.pushState(null, '', next);
+  }
+  renderLocation();
+  shell?.breadcrumbs.querySelector<HTMLElement>('[aria-current="page"]')?.focus();
+}
+function focusRow(id?: string) {
+  const target = id ? shell?.list.querySelector<HTMLElement>(`[data-node-id="${id}"] .item-trigger`) : shell?.newFolder;
+  (target ?? shell?.url)?.focus();
+}
+function cancel() {
+  if (busy) return;
+  const nodeId = mode?.node?.id;
+  mode = null; renderRows(); shell?.panel.replaceChildren(); focusRow(nodeId);
+}
+function openEditor(kind: NonNullable<typeof mode>['kind'], node?: BinderNode) {
+  mode = { kind, node }; closeMenu();
+  shell!.panel.replaceChildren(); renderRows();
+  const row = kind === 'folder' ? shell!.list.querySelector('.draft') :
+    kind === 'delete-binder' ? shell!.panel : shell!.list.querySelector(`[data-node-id="${node!.id}"]`);
+  if (kind === 'delete-binder') row!.append(editor());
+  row?.querySelector<HTMLElement>('input, select, .cancel-button')?.focus();
 }
 async function copy(edit: boolean) {
   const value = `${location.origin}/b/${id}${edit ? '/edit#' + token : ''}`;
-  try { await navigator.clipboard.writeText(value); announce(edit ? 'Edit URL copied. Keep it private; it cannot be recovered.' : 'Share URL copied.'); }
-  catch {
-    announce('Copy this URL manually:');
-    const input = element('input'); input.readOnly = true; input.value = value;
-    input.setAttribute('aria-label', edit ? 'Edit URL' : 'Share URL');
-    status.append(input); input.focus(); input.select();
+  try {
+    await navigator.clipboard.writeText(value);
+    if (shell) feedback(shell.shareNotice, edit ? 'Edit URL copied. Keep it private.' : 'Share URL copied.');
+  } catch {
+    if (!shell) return;
+    if (edit) feedback(shell.shareNotice, 'Clipboard unavailable. Copy the edit URL from your address bar and keep it private.', true);
+    else {
+      feedback(shell.shareNotice, 'Copy this share URL:', true);
+      const input = element('input'); input.value = value; input.readOnly = true; input.setAttribute('aria-label', 'Share URL');
+      shell.shareNotice.append(input); input.focus(); input.select();
+    }
   }
 }
-function inputField(container: HTMLElement, label: string, value: string, type = 'text') {
-  const wrapper = element('label', label);
-  const input = element('input');
-  input.type = type; input.value = value; input.required = true;
-  input.maxLength = type === 'url' ? 2048 : 200;
-  input.autocomplete = 'off';
-  wrapper.append(input); container.append(wrapper);
-  return input;
+function itemMenu(node: BinderNode, trigger: HTMLButtonElement, point?: { x: number; y: number }) {
+  if (busy || !editable) return;
+  const items = siblings(), index = items.findIndex(item => item.id === node.id);
+  showMenu(trigger, [
+    { label: 'Rename', action: () => openEditor('rename', node) },
+    ...(node.type === 'link' ? [{ label: 'Edit', action: () => openEditor('edit', node) }] : []),
+    { label: 'Move', action: () => openEditor('move', node) },
+    null,
+    { label: 'Move up', disabled: index <= 0, action: () => void reorder(node, -1) },
+    { label: 'Move down', disabled: index >= items.length - 1, action: () => void reorder(node, 1) },
+    null,
+    { label: 'Delete', danger: true, action: () => openEditor('delete', node) },
+  ], point);
 }
-function renderForm() {
-  if (!form || !editable) return;
-  const current = form;
-  const panel = element('form', undefined, 'inline-form');
-  panel.setAttribute('aria-label', 'Edit item');
-  const heading = { folder: 'New folder', link: 'New link', rename: 'Rename item', move: 'Move item', delete: 'Delete item', 'delete-binder': 'Delete Binder' }[current.kind];
-  panel.append(element('h2', heading));
+async function reorder(node: BinderNode, direction: -1 | 1) {
+  const items = siblings(), index = items.findIndex(item => item.id === node.id);
+  if (index < 0 || !items[index + direction]) return;
+  [items[index], items[index + direction]] = [items[index + direction], items[index]];
+  if (await perform(async () => {
+    await api(`${endpoint}/reorder`, 'PUT', { parent_id: currentFolder(), ids: items.map(item => item.id) });
+    items.forEach((item, order) => { item.sort_order = order; });
+  }, shell!.notice)) {
+    renderRows(); focusRow(node.id); feedback(shell!.notice, 'Order updated.');
+  }
+}
+function field(form: HTMLElement, label: string, value: string, type = 'text') {
+  const wrapper = element('label', label), input = element('input');
+  input.type = type; input.value = value; input.required = true; input.autocomplete = 'off';
+  input.maxLength = type === 'url' ? 2048 : 200;
+  wrapper.append(input); form.append(wrapper); return input;
+}
+function editor() {
+  const current = mode!;
+  const form = element('form', undefined, `row-editor ${current.kind === 'folder' || current.kind === 'rename' ? 'inline-name' : ''}`);
+  form.setAttribute('aria-label', current.kind === 'folder' ? 'New folder' : 'Edit item');
+  const error = notice();
+  const cancelButton = button('Cancel', cancel, 'cancel-button');
   if (current.kind === 'delete' || current.kind === 'delete-binder') {
-    panel.append(element('p', current.kind === 'delete-binder' ? 'Delete this Binder and everything in it? This cannot be undone.' : `Delete “${current.node!.title}”${current.node!.type === 'folder' ? ' and everything inside it' : ''}? This cannot be undone.`));
-    panel.append(button('Delete permanently', () => void operation(async () => {
-      await api(current.kind === 'delete-binder' ? endpoint : `${endpoint}/nodes/${current.node!.id}`, 'DELETE');
-      if (current.kind === 'delete-binder') { token = ''; location.replace('/'); return; }
-      selected = null; form = null; await reload(); announce('Deleted.');
-    }), false, 'danger'));
+    form.classList.add('delete-confirm');
+    form.append(element('p', current.kind === 'delete-binder' ? 'Delete this Binder and everything in it? This cannot be undone.' :
+      `Delete “${current.node!.title}”${current.node!.type === 'folder' ? ' and everything inside it' : ''}? This cannot be undone.`));
+    form.append(cancelButton, button('Delete permanently', () => void (async () => {
+      if (await perform(async () => {
+        await api(current.kind === 'delete-binder' ? endpoint : `${endpoint}/nodes/${current.node!.id}`, 'DELETE');
+        if (current.kind !== 'delete-binder') {
+          const ids = subtree(current.node!.id); data!.nodes = data!.nodes.filter(node => !ids.has(node.id));
+        }
+      }, error)) {
+        if (current.kind === 'delete-binder') { token = ''; location.replace('/'); return; }
+        mode = null; renderRows(); shell?.url.focus(); feedback(shell!.notice, 'Item deleted.');
+      }
+    })(), 'danger-button'));
   } else {
-    let name: HTMLInputElement | undefined, href: HTMLInputElement | undefined, destination: HTMLSelectElement | undefined;
+    let name: HTMLInputElement | undefined, url: HTMLInputElement | undefined, destination: HTMLSelectElement | undefined;
     if (current.kind === 'move') {
-      const label = element('label', 'Destination'); destination = element('select');
-      const root = element('option', 'Binder'); root.value = ''; destination.append(root);
-      const excluded = new Set<string>([current.node!.id]);
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const n of data!.nodes) if (n.parent_id && excluded.has(n.parent_id) && !excluded.has(n.id)) { excluded.add(n.id); changed = true; }
+      const label = element('label', 'Destination'); destination = element('select'); destination.setAttribute('aria-label', 'Destination');
+      const root = element('option', data!.title); root.value = ''; destination.append(root);
+      const excluded = subtree(current.node!.id);
+      for (const folder of data!.nodes.filter(node => node.type === 'folder' && !excluded.has(node.id))) {
+        const option = element('option', folderPath(folder)); option.value = folder.id; destination.append(option);
       }
-      for (const n of data!.nodes.filter(n => n.type === 'folder' && !excluded.has(n.id))) {
-        const option = element('option', folderPath(n)); option.value = n.id; destination.append(option);
-      }
-      destination.value = current.node!.parent_id ?? '';
-      label.append(destination); panel.append(label);
+      destination.value = current.node!.parent_id ?? ''; label.append(destination); form.append(label);
     } else {
-      name = inputField(panel, 'Name', current.node?.title ?? '');
-      if (current.kind === 'link' || current.node?.type === 'link') href = inputField(panel, 'URL', current.node?.url ?? '', 'url');
+      name = field(form, current.kind === 'edit' ? 'Name' : current.node?.type === 'link' ? 'Link name' : 'Folder name', current.node?.title ?? '');
+      if (current.kind !== 'edit') name.parentElement!.classList.add('name-field');
+      if (current.kind === 'edit') url = field(form, 'URL', current.node!.url!, 'url');
     }
-    const save = element('button', 'Save', 'primary'); save.type = 'submit'; save.disabled = busy;
-    panel.append(save);
-    panel.onsubmit = event => {
+    const save = element('button', current.kind === 'move' ? 'Move here' : 'Save', 'primary'); save.type = 'submit';
+    form.append(save, cancelButton);
+    form.onsubmit = event => {
       event.preventDefault();
       const body = destination ? { parent_id: destination.value || null } : {
-        title: name!.value, ...(href ? { url: href.value } : {}),
-        ...(['folder', 'link'].includes(current.kind) ? { type: current.kind, parent_id: currentFolder() } : {}),
+        title: name!.value.trim(), ...(url ? { url: url.value.trim() } : {}),
+        ...(current.kind === 'folder' ? { type: 'folder', parent_id: currentFolder() } : {}),
       };
-      void operation(async () => {
-        await api(current.node ? `${endpoint}/nodes/${current.node.id}` : `${endpoint}/nodes`, current.node ? 'PATCH' : 'POST', body);
-        if (current.kind === 'move') selected = null;
-        form = null; await reload(); announce('Saved.');
-      });
+      void (async () => {
+        let saved: BinderNode | undefined;
+        if (await perform(async () => {
+          saved = await api<BinderNode>(current.node ? `${endpoint}/nodes/${current.node.id}` : `${endpoint}/nodes`, current.node ? 'PATCH' : 'POST', body);
+          upsert(saved);
+        }, error)) {
+          mode = null; renderRows(); focusRow(current.kind === 'move' ? undefined : saved!.id);
+          feedback(shell!.notice, current.kind === 'folder' ? 'Folder created.' : current.kind === 'move' ? 'Item moved.' : 'Changes saved.');
+        } else name?.focus();
+      })();
     };
   }
-  panel.append(button('Cancel', () => { form = null; render(); }));
-  panel.onkeydown = event => { if (event.key === 'Escape') { form = null; render(); } };
-  app.append(panel);
+  form.append(error);
+  form.onkeydown = event => { if (event.key === 'Escape') { event.preventDefault(); cancel(); } };
+  return form;
 }
-async function reorder(direction: -1 | 1) {
-  const nodes = siblings(), index = nodes.findIndex(n => n.id === selected);
-  if (index < 0 || !nodes[index + direction]) return;
-  [nodes[index], nodes[index + direction]] = [nodes[index + direction], nodes[index]];
-  await operation(async () => {
-    await api(`${endpoint}/reorder`, 'PUT', { parent_id: currentFolder(), ids: nodes.map(n => n.id) });
-    await reload(); announce('Order saved.');
-  });
-}
-function render() {
-  app.replaceChildren(); app.setAttribute('aria-busy', String(busy));
-  if (!id) {
-    if (location.pathname !== '/') { app.append(element('h1', 'Page not found')); return; }
-    const landing = element('section', undefined, 'landing');
-    landing.append(element('h1', 'Binder'), element('p', 'A temporary place for links.', 'muted'));
-    landing.append(button('Create Binder', () => void operation(async () => {
-      const b = await api<{ id: string; edit_token: string }>('/api/binders', 'POST', {});
-      location.assign(`/b/${b.id}/edit#${b.edit_token}`);
-    }), false, 'primary'));
-    landing.append(element('p', 'No account. Automatically deleted after 7 days.', 'footnote'));
-    app.append(landing); return;
+function renderRows() {
+  if (!shell || !data) return;
+  shell.list.replaceChildren();
+  if (mode?.kind === 'folder') {
+    const draft = element('li', undefined, 'node draft'); draft.append(icon('folder'), editor()); shell.list.append(draft);
   }
-  if (!data) {
-    app.append(element('h1', 'Binder unavailable'), element('p', 'It may have expired or been deleted.', 'muted'));
-    app.append(button('Retry', () => void initialize()));
-    const home = element('a', 'Create a new Binder'); home.href = '/'; app.append(home); return;
-  }
-  const top = element('div', undefined, 'binder-heading');
-  top.append(element('p', editable ? 'EDITING' : 'READ ONLY', 'eyebrow'));
-  if (editable) {
-    const sharing = element('div', undefined, 'sharing');
-    sharing.append(button('Copy Share URL', () => void copy(false)), button('Copy Edit URL', () => void copy(true)));
-    top.append(sharing);
-  }
-  app.append(top);
-  const breadcrumbs = element('nav', undefined, 'breadcrumbs'); breadcrumbs.setAttribute('aria-label', 'Folders');
-  breadcrumbs.append(button(data.title, () => navigate(null)));
-  const folder = data.nodes.find(n => n.id === currentFolder());
-  const ancestors: BinderNode[] = [];
-  let ancestor = folder;
-  while (ancestor) { ancestors.unshift(ancestor); ancestor = data.nodes.find(n => n.id === ancestor!.parent_id); }
-  for (const n of ancestors) {
-    breadcrumbs.append(element('span', '/', 'muted'), button(n.title, () => navigate(n.id)));
-  }
-  breadcrumbs.lastElementChild?.setAttribute('aria-current', 'page');
-  app.append(breadcrumbs);
-  if (editable) {
-    const toolbar = element('div', undefined, 'toolbar'); toolbar.setAttribute('aria-label', 'Item actions');
-    const node = data.nodes.find(n => n.id === selected), items = siblings(), index = items.findIndex(n => n.id === selected);
-    toolbar.append(button('New Folder', () => showForm('folder')), button('New Link', () => showForm('link')),
-      element('span', undefined, 'toolbar-divider'),
-      button('Rename', () => showForm('rename', node), !node), button('Move', () => showForm('move', node), !node),
-      button('Delete', () => showForm('delete', node), !node),
-      button('Move up', () => void reorder(-1), index <= 0), button('Move down', () => void reorder(1), index < 0 || index >= items.length - 1));
-    app.append(toolbar);
-  }
-  renderForm();
-  const table = element('table');
-  const caption = element('caption', 'Folder contents', 'sr-only'); table.append(caption);
-  const head = element('thead'), header = element('tr');
-  if (editable) header.append(element('th', 'Select', 'sr-only-cell'));
-  for (const text of ['Name', 'Type']) { const th = element('th', text); th.scope = 'col'; header.append(th); }
-  head.append(header); table.append(head);
-  const body = element('tbody');
-  for (const n of siblings()) {
-    const row = element('tr'); row.classList.toggle('selected', n.id === selected);
+  for (const node of siblings()) {
+    const row = element('li', undefined, 'node'); row.dataset.nodeId = node.id;
+    if (mode?.node?.id === node.id && mode.kind === 'rename') {
+      row.append(icon(node.type), editor()); shell.list.append(row); continue;
+    }
+    const content = element('div', undefined, 'node-content');
+    const name = node.type === 'folder' ? button('', () => navigate(node.id), 'node-open') : element('a', undefined, 'node-open');
+    if (name instanceof HTMLAnchorElement) { name.href = node.url!; name.target = '_blank'; name.rel = 'noopener noreferrer'; }
+    name.append(icon(node.type), element('span', node.title, 'node-name'));
+    content.append(name);
+    if (node.type === 'link') {
+      const domain = element('span', new URL(node.url!).hostname, 'node-domain'); domain.title = node.url!; content.append(domain);
+    }
+    row.append(content);
     if (editable) {
-      const cell = element('td', undefined, 'selection');
-      const radio = element('input'); radio.type = 'radio'; radio.name = 'selection'; radio.checked = n.id === selected;
-      radio.setAttribute('aria-label', `Select ${n.title}`); radio.disabled = busy;
-      radio.onchange = () => { selected = n.id; form = null; render(); app.querySelector<HTMLInputElement>('input:checked')?.focus(); };
-      cell.append(radio); row.append(cell);
+      const trigger = iconButton(`Actions for ${node.title}`, 'more', () => itemMenu(node, trigger)); trigger.classList.add('item-trigger');
+      trigger.setAttribute('aria-haspopup', 'menu'); trigger.setAttribute('aria-expanded', 'false'); row.append(trigger);
+      row.oncontextmenu = event => { event.preventDefault(); itemMenu(node, trigger, { x: event.clientX, y: event.clientY }); };
+      row.onkeydown = event => {
+        if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); itemMenu(node, trigger); }
+      };
     }
-    const cell = element('td', undefined, 'name-cell');
-    const icon = element('span', undefined, n.type === 'folder' ? 'folder-icon' : 'link-icon'); icon.setAttribute('aria-hidden', 'true');
-    let name: HTMLButtonElement | HTMLAnchorElement;
-    if (n.type === 'folder') name = button(n.title, () => navigate(n.id), false, 'item-name');
-    else {
-      name = element('a', n.title, 'item-name'); name.href = n.url!; name.target = '_blank'; name.rel = 'noopener noreferrer';
-      name.title = n.url!;
-    }
-    cell.append(icon, name); row.append(cell, element('td', n.type === 'folder' ? 'Folder' : 'Link', 'type-cell')); body.append(row);
+    if (mode?.node?.id === node.id) row.append(editor());
+    shell.list.append(row);
   }
-  if (!body.children.length) {
-    const row = element('tr'), cell = element('td', editable ? 'No links or folders yet. Add one above.' : 'This folder is empty.', 'empty');
-    cell.colSpan = editable ? 3 : 2; row.append(cell); body.append(row);
+  if (!shell.list.children.length) shell.list.append(element('li', editable ? 'No links yet. Paste a URL above, or add a folder.' : 'This folder is empty.', 'empty'));
+}
+function renderLocation() {
+  if (!shell || !data) return;
+  shell.panel.replaceChildren(); shell.breadcrumbs.replaceChildren();
+  const root = button(data.title, () => navigate(null)); shell.breadcrumbs.append(root);
+  const ancestors: BinderNode[] = [];
+  let ancestor = data.nodes.find(node => node.id === currentFolder());
+  while (ancestor) { ancestors.unshift(ancestor); ancestor = data.nodes.find(node => node.id === ancestor!.parent_id); }
+  for (const node of ancestors) shell.breadcrumbs.append(element('span', '/', 'separator'), button(node.title, () => navigate(node.id)));
+  shell.breadcrumbs.lastElementChild?.setAttribute('aria-current', 'page');
+  renderRows();
+}
+function mountBinder() {
+  const header = element('section', undefined, 'binder-header');
+  const identity = element('div', undefined, 'binder-identity');
+  identity.append(element('h1', data!.title));
+  const expiry = element('details', undefined, 'expiry'), countdown = element('summary', '', 'countdown');
+  const absolute = element('time', `Deletes ${new Date(data!.expires_at).toLocaleString()}`);
+  absolute.dateTime = new Date(data!.expires_at).toISOString(); expiry.append(countdown, absolute); identity.append(expiry);
+  const sharing = element('div', undefined, 'sharing');
+  sharing.append(button('Share', () => void copy(false), 'primary'));
+  if (editable) {
+    const options = iconButton('Binder options', 'more', () => showMenu(options, [
+      { label: 'Copy edit URL', action: () => void copy(true) }, null,
+      { label: 'Delete Binder', danger: true, action: () => openEditor('delete-binder') },
+    ]));
+    options.setAttribute('aria-haspopup', 'menu'); options.setAttribute('aria-expanded', 'false'); sharing.append(options);
   }
-  table.append(body); app.append(table);
-  const footer = element('footer', undefined, 'binder-footer');
-  const expiry = element('div'); expiry.append(element('p', '', 'countdown'));
-  const absolute = element('time', `Deletes ${new Date(data.expires_at).toLocaleString()}`, 'footnote'); absolute.dateTime = new Date(data.expires_at).toISOString(); expiry.append(absolute); footer.append(expiry);
-  if (editable) footer.append(button('Delete Binder', () => { showForm('delete-binder'); app.querySelector('.inline-form')?.scrollIntoView({ block: 'nearest' }); }, false, 'quiet-danger'));
-  app.append(footer);
-  if (editable) app.append(element('p', 'Keep your edit URL. Anyone with it can make changes; a lost URL cannot be recovered.', 'footnote edit-note'));
-  updateExpiry();
+  header.append(identity, sharing);
+  const shareNotice = notice(); shareNotice.classList.add('share-feedback');
+  const breadcrumbs = element('nav', undefined, 'breadcrumbs'); breadcrumbs.setAttribute('aria-label', 'Folders');
+  const panel = element('div', undefined, 'binder-panel');
+  const composer = element('div', undefined, 'composer');
+  const addForm = element('form', undefined, 'url-form'), url = element('input');
+  url.type = 'url'; url.placeholder = 'Paste a URL to add a link'; url.setAttribute('aria-label', 'Add a link');
+  url.required = true; url.maxLength = 2048; url.autocomplete = 'off'; url.spellcheck = false;
+  const add = element('button', 'Add link'); add.type = 'submit';
+  addForm.append(url, add);
+  const newFolder = button('New Folder', () => openEditor('folder'), 'new-folder');
+  const composerNotice = notice();
+  addForm.onsubmit = event => {
+    event.preventDefault();
+    const value = url.value.trim();
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error();
+    } catch { feedback(composerNotice, 'Use an http or https URL without credentials.', true); url.focus(); return; }
+    const body = { type: 'link', title: parsed.hostname.slice(0, 200), url: value, parent_id: currentFolder() };
+    void (async () => {
+      if (await perform(async () => { upsert(await api<BinderNode>(`${endpoint}/nodes`, 'POST', body)); }, composerNotice)) {
+        url.value = ''; renderRows(); feedback(composerNotice, 'Link added.');
+      }
+      url.focus();
+    })();
+  };
+  composer.append(addForm, newFolder);
+  const listNotice = notice(), list = element('ul', undefined, 'node-list'); list.setAttribute('aria-label', 'Folder contents');
+  app.replaceChildren(header, shareNotice, breadcrumbs, panel);
+  if (editable) app.append(composer, composerNotice);
+  app.append(listNotice, list);
+  return { header, countdown, shareNotice, breadcrumbs, panel, url, newFolder, notice: listNotice, list };
+}
+function unavailable(message: string) {
+  shell = null; mode = null; closeMenu();
+  const section = element('section', undefined, 'unavailable'); section.append(element('h1', 'Binder unavailable'));
+  const error = notice(); feedback(error, message, true); section.append(error);
+  section.append(button('Retry', () => void initialize()));
+  const home = element('a', 'Create a new Binder', 'text-button'); home.href = '/'; section.append(home); app.replaceChildren(section);
 }
 function updateExpiry() {
-  if (!data) return;
+  if (!data || !shell) return;
   const remaining = data.expires_at - Date.now();
-  if (remaining <= 0) { data = null; editable = false; form = null; render(); announce('Binder expired. Its links are no longer available.', true); return; }
-  const hours = Math.floor(remaining / 3600000), minutes = Math.floor(remaining / 60000) % 60;
-  const countdown = app.querySelector('.countdown');
-  if (countdown) countdown.textContent = `Expires in ${hours >= 24 ? Math.floor(hours / 24) + 'd ' : ''}${hours % 24}h ${minutes}m`;
+  if (remaining <= 0) { data = null; editable = false; unavailable('Binder expired. Its links are no longer available.'); return; }
+  const hours = Math.floor(remaining / 3600000);
+  shell.countdown.textContent = hours >= 24 ? `Expires in ${Math.floor(hours / 24)}d ${hours % 24}h` :
+    `Expires in ${hours}h ${Math.floor(remaining / 60000) % 60}m`;
 }
 async function initialize() {
-  busy = true; app.setAttribute('aria-busy', 'true'); announce('');
+  const version = ++loadVersion;
+  mode = null; editable = false; closeMenu(); shell = null;
+  app.setAttribute('aria-busy', 'true'); app.replaceChildren(element('p', 'Loading Binder…', 'loading'));
   try {
-    if (id) {
-      await reload();
-      if (editing) {
-        await api(`${endpoint}/access`);
-        editable = true;
-      }
+    const loaded = await api<BinderData>(endpoint);
+    let accessError = '';
+    if (editing) {
+      try { await api(`${endpoint}/access`); }
+      catch (error) { accessError = error instanceof Error ? error.message : 'Could not verify editing access. Reload to retry.'; }
     }
+    if (version !== loadVersion) return;
+    data = loaded; editable = editing && !accessError;
+    shell = mountBinder(); renderLocation(); updateExpiry();
+    if (accessError && shell) feedback(shell.notice, accessError, true);
   } catch (error) {
-    editable = false;
-    announce(error instanceof Error ? error.message : 'Could not load Binder. Check your connection and retry.', true);
-  } finally { busy = false; render(); }
+    if (version === loadVersion) { data = null; unavailable(error instanceof Error ? error.message : 'Could not load Binder. Check your connection and retry.'); }
+  } finally { if (version === loadVersion) app.setAttribute('aria-busy', 'false'); }
 }
-window.addEventListener('popstate', () => { selected = null; form = null; render(); });
-window.addEventListener('hashchange', () => { token = editing ? location.hash.slice(1) : ''; editable = false; void initialize(); });
+function landing() {
+  const section = element('section', undefined, 'landing');
+  section.append(element('h1', 'A temporary place for links.'), element('p', 'Collect links in folders. Share one URL.', 'muted'));
+  const message = notice();
+  section.append(button('Create Binder', () => void (async () => {
+    await perform(async () => {
+      const binder = await api<{ id: string; edit_token: string }>('/api/binders', 'POST', {});
+      location.assign(`/b/${binder.id}/edit#${binder.edit_token}`);
+    }, message);
+  })(), 'primary'));
+  section.append(element('p', 'No account. Deleted after 7 days.', 'footnote'), message); app.replaceChildren(section);
+  app.setAttribute('aria-busy', 'false');
+}
+window.addEventListener('popstate', () => { if (shell) navigate(currentFolder(), false); });
+window.addEventListener('hashchange', () => { token = editing ? location.hash.slice(1) : ''; if (id) void initialize(); });
+window.addEventListener('resize', () => closeMenu());
 setInterval(updateExpiry, 1000);
-void initialize();
+if (id) void initialize();
+else if (location.pathname === '/') landing();
+else { app.replaceChildren(element('h1', 'Page not found')); app.setAttribute('aria-busy', 'false'); }
