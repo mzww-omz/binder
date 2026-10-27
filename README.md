@@ -8,6 +8,19 @@ Node.js **22.12以上**、npmが必要です。Node.js 26で検証していま�
 
 ```sh
 npm ci
+
+# ローカル用のHMAC鍵を生成（値を表示せず、既存の鍵は上書きしない）
+node --input-type=module <<'JS'
+import { existsSync, readFileSync, appendFileSync, chmodSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+const file = '.dev.vars';
+const current = existsSync(file) ? readFileSync(file, 'utf8') : '';
+if (!/^\s*(?:export\s+)?IP_RATE_LIMIT_SECRET\s*=/m.test(current)) {
+  appendFileSync(file, `\nIP_RATE_LIMIT_SECRET="${randomBytes(32).toString('hex')}"\n`, { mode: 0o600 });
+}
+chmodSync(file, 0o600);
+JS
+
 npm run db:migrate
 npm run dev
 ```
@@ -38,6 +51,7 @@ npm run dev
 ```text
 src/
   worker.ts                   Hono API、認証、Cron、保存済みfaviconの配信
+  creation-limit.ts           IP正規化・日単位HMAC・日本時間のリセット時刻
   metadata.ts                 URL / DNS検証、上限付きHTML・favicon取得
   enrichment.ts               waitUntil処理、取得予算・世代・手動タイトル保護
   types.ts                    API / UI共通のデータ型
@@ -52,10 +66,13 @@ migrations/
   0001_initial.sql            テーブル、インデックス、整合性トリガー
   0002_require_link_url.sql   SQLiteのNULL評価を補う制約
   0003_link_metadata.sql      既存データを保持してメタデータ用カラムを追加
+  0004_daily_creation_limits.sql  日単位の作成上限カウンター
 tests/
   setup.ts                    ローカルD1のマイグレーション適用
   api.test.ts                 実D1 / workerdでの統合テスト
   locale.test.ts              日本語エラー・残り時間の境界テスト
+  creation-limit.test.ts      IP正規化・HMAC・日本時間の境界テスト
+  creation-limit-api.test.ts  50件上限・同時実行・ロールバック・Cron
   metadata.test.ts            外部HTTPを制御した取得・解析・SSRF境界テスト
   metadata-api.test.ts        実D1での非同期取得・競合・配信テスト
   metadata-browser.mjs        自動反映・手動編集中・アイコン失敗のUI検証
@@ -66,6 +83,29 @@ wrangler.jsonc
 ```
 
 実行時依存はHonoと `entities` のみです。HTMLRewriterは文字参照を生のまま返すため、HTML5の名前付き・数値文字参照を正しくデコードする専用ライブラリを使います。React、認証サービス、外部フォント、解析SDK、第三者faviconサービスは使用していません。`package-lock.json`をコミットし、開発ツールの間接依存undici / zodは修正版の互換メジャーへoverrideしています。
+
+## 同一IPからの作成上限
+
+- **日本時間（UTC+9）の0時〜24時に、同一IPから成功したBinder作成を50件まで**許可します。51件目はHTTP 429と `Retry-After`（次の日本時間0時までの秒数）を返し、日本語で案内します。過去24時間のローリング制限ではありません。
+- Binderを削除しても件数は戻りません。既存の全体上限（保持中の直近1時間20件・全体2,000件）も引き続き適用します。その制限やDB障害等で作成に失敗した場合、IPの枠は消費しません。
+- 接続元はCloudflareが設定する `CF-Connecting-IP` だけを使用し、`X-Forwarded-For` / `X-Real-IP` は信用しません。IPv4 / IPv6の表記を正規化し、IPv4-mapped IPv6も同じIPv4として数えます。IPが欠落・不正な場合は制限を迂回せず503にします。
+- D1には日付を含む **HMAC-SHA-256識別子・成功件数・リセット時刻だけ**を保存します。平文IPやBinderとの対応表は保存しません。日付が変わると識別子も変わります。
+- カウンター予約とBinder挿入をD1の同じトランザクション（batch）で行います。同時リクエストでも50件を超えず、挿入失敗時は予約もロールバックします。
+- 日付境界をまたぐ処理を保護するため前日分は保持し、その翌日の0時以降にCronで削除します（1回最大1,000件、遅延・バックログはあり得ます）。通常の保持期間は約24〜48時間＋Cron遅延です。
+- 共有回線・学校・会社・VPN等では同一IPの利用者で50件を共有します。IPを変更できる利用者やbot全般を防ぐものではありません。
+
+### HMAC鍵の設定
+
+`IP_RATE_LIMIT_SECRET` は32文字以上のランダムな秘密値を使用します。上記のローカルセットアップは256bitの鍵を `.dev.vars` に生成し、Gitには含めません。生成・変更後は開発サーバーを再起動してください。未設定・短すぎる鍵では作成APIが503になります。
+
+**本番公開時には、明示的な許可を得たうえで**WorkerのSecretとして別途設定してください（この作業では未実施）。値をログ・チャット・Gitへ貼り付けないでください。
+
+```sh
+# クラウド変更。許可後のみ実行し、秘密値は安全な方法で入力する
+npx wrangler secret put IP_RATE_LIMIT_SECRET
+```
+
+鍵を日中に変更するとその日の識別子が変わり、作成枠が実質リセットされます。通常の再起動やデプロイでは同じ鍵を維持してください。Wranglerローカル環境では接続元ヘッダーの信頼境界が本番と異なるため、開発サーバーを外部公開しないでください。
 
 ## 自動メタデータ
 
@@ -103,6 +143,7 @@ DNSチェックは接続IPを固定するものではありません。DNS rebin
 | --- | --- |
 | `binders` | `id` PK、`title`、`edit_token_hash`、`created_at`、`expires_at`、`updated_at`、`metadata_requests` |
 | `nodes` | `id` PK、`binder_id` FK、`parent_id` nullable FK、`type`、`title`、`url` nullable、`sort_order`、`created_at`、`updated_at`、`title_is_manual`、`metadata_status`、`metadata_version`、`favicon`（BLOB）、`favicon_type` |
+| `binder_creation_limits` | `ip_day_hash` PK、`reset_at`、`created_count`（1〜50） |
 
 - `expires_at = created_at + 604800000` をCHECK制約で固定。
 - Binder IDは128bit、編集トークンは256bitの暗号学的乱数（hex表現）。DBにはSHA-256ハッシュのみ保存。
@@ -161,13 +202,13 @@ Nodeレスポンスには `metadata_status`（none / pending / ready / failed）
 
 JSONのリクエストには `Content-Type: application/json`、編集リクエストには `Authorization: Bearer SECRET_TOKEN` を送ります。編集URLは `/b/ID/edit#SECRET_TOKEN`。フラグメントはHTTPリクエストやRefererには含まれません。トークンは作成時に1回だけJSONで返し、閲覧APIにはハッシュもトークンも返しません。
 
-主なレスポンス：作成201、取得・更新200、削除204、不正入力400、認証エラー401、存在しない・期限切れ404、集合の競合・項目上限409、サイズ超過413、Content-Type違い415、作成上限429。予期しないDBエラーは内部情報を出さず500です。
+主なレスポンス：作成201、取得・更新200、削除204、不正入力400、認証エラー401、存在しない・期限切れ404、集合の競合・項目上限409、サイズ超過413、Content-Type違い415、作成上限429、IP・HMAC鍵を確認できない場合は503。予期しないDBエラーは内部情報を出さず500です。
 
 ### 有効期限とCron
 
 期限の判定は **`now >= expires_at` でアクセス禁止**。GET時はデータ取得後にも検査します。Node作成・更新はDB実行時にも期限を検査し、削除SQLもDB実行時の時計で確認します。閲覧・編集APIの期限拒否はCronの実行を待ちません。
 
-Cronは15分ごと、1回最大10 Binderを期限順に物理削除します。大量のカスケード削除を1回に集中させないための制限です。障害や大量データで未削除の期限切れデータが残ってもアクセスは禁止されます。物理削除の完了時刻は7日ぴったりではありません。
+Cronは15分ごと、1回最大10 Binderを期限順に物理削除します。大量のカスケード削除を1回に集中させないための制限です。障害や大量データで未削除の期限切れデータが残ってもアクセスは禁止されます。物理削除の完了時刻は7日ぴったりではありません。同じCronで古い作成上限カウンターも最大1,000件削除します。
 
 Cloudflareのバックアップ / Time Travelの保持期間はアプリ側の削除と別です。「物理削除」は稼働中DBからの削除を指し、プラットフォームのバックアップから即座に消去する保証ではありません。
 
@@ -184,7 +225,7 @@ VitestはCloudflare公式プラグインで**ローカルworkerdとD1**を動か
 
 自動メタデータ追加後の検証結果：
 
-- **102テスト成功**（既存API20件、日本語表示20件、メタデータ55件、メタデータD1統合7件）。D1統合テスト：作成、3階層Folder、Link作成・編集、移動、循環 / 異なるBinder / Link親の拒否、Node・配下一括・Binder削除、全更新APIのトークン検証、他Binderのトークン拒否、並び替え・不正な集合の拒否、期限直前 / ちょうど期限、期限後の各更新拒否、処理中の期限超過、Cron、期限不変、不正URL7パターン、入力制限、同時作成での上限検証など。
+- **126テスト成功**（既存API20件、日本語表示22件、メタデータ55件、メタデータD1統合7件、日次キー14件、日次制限API8件）。50件成功・51件目拒否、削除後の枠維持、IP別枠、同時実行、失敗時のロールバック、JST日付境界、ヘッダー偽装対策、鍵欠落時の拒否、Cron清掃を確認しています。D1統合テスト：作成、3階層Folder、Link作成・編集、移動、循環 / 異なるBinder / Link親の拒否、Node・配下一括・Binder削除、全更新APIのトークン検証、他Binderのトークン拒否、並び替え・不正な集合の拒否、期限直前 / ちょうど期限、期限後の各更新拒否、処理中の期限超過、Cron、期限不変、不正URL7パターン、入力制限、同時作成での上限検証など。
 - TypeScript・Viteビルド成功。外部HTTPだけをモックし、HTMLRewriter・実D1マイグレーション・背景ジョブ・画像配信は実装を通して検証。タイトル優先、文字参照、相対favicon、PNG / ICO / SVG、サイズ・時間上限、DNS / リダイレクト拒否、手動名・既存行・URL世代保護、400回予算の競合をテストしています。
 - 実際の外部取得もローカルWorkerで確認。`example.com` は保存8ms（1回の観測値、性能保証ではありません）で返り、後から `Example Domain` に更新。GitHubはページタイトルと958バイトのPNG faviconを取得し、同一オリジンの画像APIが200を返しました。検証用Binderは削除済みです。
 - `npm audit`：開発依存を含め **0 vulnerabilities**（実行時点）。
@@ -237,7 +278,7 @@ curl 'http://localhost:8787/cdn-cgi/local/scheduled?format=json'
 
 ### 実装済みの境界
 
-- アカウント、メール、IP、アクセス履歴をDBに収集しません。Worker側でリクエスト・トークン・入力内容をログ出力しません。Observabilityは無効です。ただしCloudflare等のプラットフォーム自身によるログ保存まで制御するものではありません。
+- アカウント・メール・アクセス履歴をDBに収集しません。作成制限のためIPを処理しますが、平文IPは保存せず、D1に日単位HMACと作成件数等だけを保存します。Worker側でIP・リクエスト・トークン・入力内容をログ出力しません。Observabilityは無効です。ただしCloudflare等のプラットフォーム自身によるログ保存まで制御するものではありません。
 - 編集URLはBearer権限です。URLを知る全員が変更・全削除できます。ブラウザー履歴、拡張機能、クリップボード、画面共有からの漏えいに注意してください。トークン回復・ローテーションはありません。
 - 閲覧URLも秘密文書向けの認証ではありません。URLを知る誰でも閲覧できます。機密情報を置かないでください。
 - 入力をHTMLとして挿入せず `textContent` を使用。CSP、frame-ancestors、nosniff、no-referrer、Permissions-Policy、noindex、no-storeをAPIとStatic Assetsへ設定。
@@ -251,7 +292,7 @@ curl 'http://localhost:8787/cdn-cgi/local/scheduled?format=json'
 
 上限は本格的なbot対策ではありません。攻撃者が作成枠を占有すれば正規ユーザーも作成できなくなり、作成後すぐ削除するbotは保持行ベースの作成制限を迂回できます。閲覧連打や不正トークンのリクエストだけでもWorkers / D1の無料枠を消費します。
 
-公開前に、無料の**Cloudflare TurnstileをBinder作成に適用**し、サーバー側で検証することを推奨します。専用ドメインがあればFreeプランで使えるWAFルール等も検討してください。これらは未設定で、既存アカウント資源を勝手に作成・変更していません。必要なら将来、個人を追跡しない時間帯別の作成カウンターとサービス停止スイッチを追加します。
+公開前に、無料の**Cloudflare TurnstileをBinder作成に適用**し、サーバー側で検証することを推奨します。専用ドメインがあればFreeプランで使えるWAFルール等も検討してください。これらは未設定で、既存アカウント資源を勝手に作成・変更していません。同一IPの日次50件制限は実装済みです。必要なら将来、サービス全体の削除に影響されない時間帯別カウンターや停止スイッチを追加します。
 
 公式資料確認時点（2026-10-26）：
 
