@@ -20,6 +20,12 @@ export async function run(page) {
   await page.getByRole('heading', { name: 'リンクをまとめて、一時的に共有。', exact: true }).waitFor();
   await page.getByLabel('テーマ', { exact: true }).selectOption('light');
   await page.screenshot({ path: '/tmp/binder-ja-home.png', fullPage: true });
+  await page.route(`${origin}/api/binders`, route => route.fulfill({
+    status: 429, headers: { 'Retry-After': '60' }, contentType: 'application/json',
+    body: JSON.stringify({ error: 'Daily Binder creation limit reached (50 per IP).' }),
+  }), { times: 1 });
+  await page.getByRole('button', { name: 'Binderを作成', exact: true }).click();
+  await page.getByText('同じIPアドレスから作成できるBinderは1日50件までです。日本時間の午前0時以降にお試しください。', { exact: true }).waitFor();
   await page.getByRole('button', { name: 'Binderを作成', exact: true }).click();
   await page.waitForURL(/\/edit#[a-f0-9]{64}$/);
   const editURL = page.url(), shareURL = editURL.split('/edit#')[0];

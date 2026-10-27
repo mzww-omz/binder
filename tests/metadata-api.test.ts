@@ -15,7 +15,7 @@ function outbound(page: () => Promise<Response> = async () => new Response('<tit
 async function request(path: string, method = 'GET', body?: unknown, token?: string) {
   const ctx = createExecutionContext();
   const response = await worker.fetch(new Request(`https://binder.test/api${path}`, {
-    method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    method, headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '203.0.113.1', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   }), env as never, ctx);
   return { response, ctx };

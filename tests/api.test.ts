@@ -6,7 +6,7 @@ import worker from '../src/worker';
 const request = (path: string, method = 'GET', body?: unknown, token?: string) =>
   exports.default.fetch(`https://binder.test/api${path}`, {
     method,
-    headers: { ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    headers: { 'CF-Connecting-IP': '203.0.113.1', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });

@@ -4,8 +4,9 @@ import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import type { Binder, BinderNode } from './types';
 import { enrichNode } from './enrichment';
+import { creationBucket } from './creation-limit';
 
-type Bindings = { DB: D1Database; ASSETS: Fetcher };
+type Bindings = { DB: D1Database; ASSETS: Fetcher; IP_RATE_LIMIT_SECRET?: string };
 type Variables = { binder: Binder & { edit_token_hash: string } };
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 const columns = 'id, title, created_at, expires_at, updated_at';
@@ -79,8 +80,24 @@ app.post('/api/binders', async c => {
   const name = data.title === undefined ? 'Binder' : title(data.title);
   const id = random(16), token = random(32), now = Date.now();
   const expires = now + 604800000;
-  await c.env.DB.prepare('INSERT INTO binders (id, title, edit_token_hash, created_at, expires_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(id, name, await hash(token), now, expires, now).run();
+  // Only Cloudflare's edge-provided client address is trusted; never X-Forwarded-For.
+  const bucket = await creationBucket(c.req.header('CF-Connecting-IP'), c.env.IP_RATE_LIMIT_SECRET, now);
+  if (!bucket) return c.json({ error: 'Creation limit unavailable' }, 503);
+  try {
+    // D1 batch is atomic: failed inserts refund the reservation and concurrent requests cannot exceed 50.
+    await c.env.DB.batch([
+      c.env.DB.prepare(`INSERT INTO binder_creation_limits (ip_day_hash, reset_at, created_count) VALUES (?, ?, 1)
+        ON CONFLICT(ip_day_hash) DO UPDATE SET created_count = created_count + 1`).bind(bucket.hash, bucket.resetAt),
+      c.env.DB.prepare('INSERT INTO binders (id, title, edit_token_hash, created_at, expires_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .bind(id, name, await hash(token), now, expires, now),
+    ]);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('ip_daily_limit')) {
+      c.header('Retry-After', String(Math.max(1, Math.ceil((bucket.resetAt - Date.now()) / 1000))));
+      return c.json({ error: 'Daily Binder creation limit reached (50 per IP).' }, 429);
+    }
+    throw error;
+  }
   return c.json({ id, title: name, edit_token: token, created_at: now, expires_at: expires, updated_at: now }, 201);
 });
 app.use('/api/binders/:id/*', async (c, next) => {
@@ -221,7 +238,12 @@ export default {
   fetch: app.fetch,
   async scheduled(_controller: ScheduledController, env: Bindings, _ctx: ExecutionContext) {
     // Bound each invocation; API expiry never depends on this cleanup completing.
-    await env.DB.prepare('DELETE FROM binders WHERE id IN (SELECT id FROM binders WHERE expires_at <= ? ORDER BY expires_at LIMIT 10)')
-      .bind(Date.now()).run();
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM binders WHERE id IN (SELECT id FROM binders WHERE expires_at <= ? ORDER BY expires_at LIMIT 10)').bind(Date.now()),
+      // Keep yesterday's bucket so a request crossing midnight cannot recreate an already-full bucket.
+      env.DB.prepare(`DELETE FROM binder_creation_limits WHERE ip_day_hash IN
+        (SELECT ip_day_hash FROM binder_creation_limits WHERE reset_at <= ? ORDER BY reset_at LIMIT 1000)`)
+        .bind(Date.now() - 86400000),
+    ]);
   },
 } satisfies ExportedHandler<Bindings>;

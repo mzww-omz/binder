@@ -22,6 +22,8 @@ const apiErrors: Record<string, string> = {
   'Invalid order': '並び順が正しくありません。',
   'Order must contain every sibling exactly once': '並び順が正しくありません。再読み込みしてお試しください。',
   'Items changed. Reload and try again.': '内容が変更されています。再読み込みしてお試しください。',
+  'Daily Binder creation limit reached (50 per IP).': '同じIPアドレスから作成できるBinderは1日50件までです。日本時間の午前0時以降にお試しください。',
+  'Creation limit unavailable': '作成制限を確認できませんでした。しばらくしてからお試しください。',
   'Creation limit reached. Please try later.': '作成上限に達しました。しばらくしてからお試しください。',
   'A Binder can hold up to 200 items': '1つのBinderに追加できる項目は200件までです。',
   'Invalid item or destination': '項目や移動先を確認してください。',
