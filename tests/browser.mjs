@@ -8,6 +8,12 @@ export async function run(page) {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  // Stable manual-title fixtures for regression; automatic titles have their own UI/Worker tests.
+  await page.route('**/api/binders/*/nodes', async route => {
+    const body = route.request().postDataJSON();
+    if (body.type === 'link' && body.title === undefined) body.title = new URL(body.url).hostname;
+    await route.continue({ postData: JSON.stringify(body) });
+  });
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto(origin);
   equal(await page.locator('html').getAttribute('lang'), 'ja');
@@ -137,7 +143,7 @@ export async function run(page) {
   await page.getByLabel('URL', { exact: true }).fill('https://example.org/docs');
   await page.getByRole('button', { name: '保存', exact: true }).click();
   await list.getByRole('link', { name: '<img src=x onerror=alert(1)>', exact: true }).waitFor();
-  equal(await page.locator('#app img').count(), 0);
+  equal(await page.locator('#app img[src="x"], #app img[onerror]').count(), 0);
   await choose('<img src=x onerror=alert(1)>', '名前を変更');
   await page.getByRole('textbox', { name: 'リンク名', exact: true }).fill('資料');
   await page.getByRole('textbox', { name: 'リンク名', exact: true }).press('Enter');

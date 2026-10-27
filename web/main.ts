@@ -14,6 +14,47 @@ let editable = false, busy = false, loadVersion = 0;
 let mode: { kind: 'folder' | 'rename' | 'edit' | 'move' | 'delete' | 'delete-binder'; node?: BinderNode } | null = null;
 let shell: ReturnType<typeof mountBinder> | null = null;
 const timers = new WeakMap<HTMLElement, ReturnType<typeof setTimeout>>();
+const failedIcons = new Set<string>();
+let metadataTimer: ReturnType<typeof setTimeout> | undefined, polling = false, pollAttempts = 0;
+
+function linkIcon(node: BinderNode) {
+  const source = node.favicon_url;
+  if (!source || failedIcons.has(source) || !source.startsWith(`${endpoint}/nodes/${node.id}/favicon?v=`)) return icon('link');
+  const image = element('img', undefined, 'icon favicon');
+  image.alt = ''; image.width = 18; image.height = 18; image.loading = 'lazy'; image.decoding = 'async'; image.referrerPolicy = 'no-referrer';
+  image.onerror = () => { failedIcons.add(source); image.replaceWith(icon('link')); };
+  image.src = source; return image;
+}
+function watchMetadata(reset = false) {
+  if (reset) pollAttempts = 0;
+  if (metadataTimer || polling || pollAttempts >= 6 || !data?.nodes.some(node => node.metadata_status === 'pending')) return;
+  metadataTimer = setTimeout(async () => {
+    metadataTimer = undefined;
+    if (busy || document.hidden) { watchMetadata(); return; }
+    if (!data) return;
+    const version = loadVersion, snapshot = new Map(data.nodes.map(node => [node.id, node]));
+    polling = true; pollAttempts++;
+    try {
+      const fresh = await api<BinderData>(endpoint);
+      if (version !== loadVersion || !data) return;
+      for (const node of fresh.nodes) {
+        const previous = data.nodes.find(item => item.id === node.id);
+        if (!previous || previous !== snapshot.get(node.id) || previous.metadata_status !== 'pending') continue;
+        upsert(node);
+        // Update only content, never rebuild a row containing an active editor or menu.
+        if (mode?.node?.id === node.id) continue;
+        const row = shell?.list.querySelector<HTMLElement>(`[data-node-id="${node.id}"]`);
+        const name = row?.querySelector('.node-name'); if (name) name.textContent = node.title;
+        row?.querySelector('.item-trigger')?.setAttribute('aria-label', `「${node.title}」の操作`);
+        const link = row?.querySelector<HTMLAnchorElement>('a.node-open');
+        if (link) { link.href = node.url!; if (previous.favicon_url !== node.favicon_url) link.firstElementChild?.replaceWith(linkIcon(node)); }
+        const domain = row?.querySelector<HTMLElement>('.node-domain');
+        if (domain) { domain.textContent = new URL(node.url!).hostname; domain.title = node.url!; }
+      }
+    } catch { /* Keep the saved hostname/generic icon; metadata failures need no intrusive alert. */ }
+    finally { polling = false; watchMetadata(); }
+  }, 1000);
+}
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
@@ -126,6 +167,7 @@ function cancel() {
   mode = null; renderRows(); shell?.panel.replaceChildren(); focusRow(nodeId);
 }
 function openEditor(kind: NonNullable<typeof mode>['kind'], node?: BinderNode) {
+  if (node) node = data?.nodes.find(item => item.id === node!.id) ?? node;
   mode = { kind, node }; closeMenu();
   shell!.panel.replaceChildren(); renderRows();
   const row = kind === 'folder' ? shell!.list.querySelector('.draft') :
@@ -150,6 +192,7 @@ async function copy(edit: boolean) {
 }
 function itemMenu(node: BinderNode, trigger: HTMLButtonElement, point?: { x: number; y: number }) {
   if (busy || !editable) return;
+  node = data!.nodes.find(item => item.id === node.id) ?? node;
   const items = siblings(), index = items.findIndex(item => item.id === node.id);
   showMenu(trigger, [
     { label: '名前を変更', action: () => openEditor('rename', node) },
@@ -230,7 +273,7 @@ function editor() {
           saved = await api<BinderNode>(current.node ? `${endpoint}/nodes/${current.node.id}` : `${endpoint}/nodes`, current.node ? 'PATCH' : 'POST', body);
           upsert(saved);
         }, error)) {
-          mode = null; renderRows(); focusRow(current.kind === 'move' ? undefined : saved!.id);
+          mode = null; renderRows(); watchMetadata(true); focusRow(current.kind === 'move' ? undefined : saved!.id);
           feedback(shell!.notice, current.kind === 'folder' ? 'フォルダーを作成しました。' : current.kind === 'move' ? '項目を移動しました。' : '変更を保存しました。');
         } else name?.focus();
       })();
@@ -254,12 +297,10 @@ function renderRows() {
     const content = element('div', undefined, 'node-content');
     const name = node.type === 'folder' ? button('', () => navigate(node.id), 'node-open') : element('a', undefined, 'node-open');
     if (name instanceof HTMLAnchorElement) { name.href = node.url!; name.target = '_blank'; name.rel = 'noopener noreferrer'; }
-    name.append(icon(node.type), element('span', node.title, 'node-name'));
+    name.append(node.type === 'folder' ? icon('folder') : linkIcon(node), element('span', node.title, 'node-name'));
     content.append(name);
     if (node.type === 'link') {
-      const parsed = new URL(node.url!);
-      const detail = node.title === parsed.hostname ? parsed.pathname : parsed.hostname;
-      const domain = element('span', detail, 'node-domain'); domain.title = node.url!; content.append(domain);
+      const domain = element('span', new URL(node.url!).hostname, 'node-domain'); domain.title = node.url!; content.append(domain);
     }
     row.append(content);
     if (editable) {
@@ -325,10 +366,10 @@ function mountBinder() {
       parsed = new URL(value);
       if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error();
     } catch { feedback(composerNotice, 'httpまたはhttpsで始まる、ユーザー名・パスワードを含まないURLを入力してください。', true); url.focus(); return; }
-    const body = { type: 'link', title: parsed.hostname.slice(0, 200), url: value, parent_id: currentFolder() };
+    const body = { type: 'link', url: value, parent_id: currentFolder() };
     void (async () => {
       if (await perform(async () => { upsert(await api<BinderNode>(`${endpoint}/nodes`, 'POST', body)); }, composerNotice)) {
-        url.value = ''; renderRows(); feedback(composerNotice, 'リンクを追加しました。');
+        url.value = ''; renderRows(); watchMetadata(true); feedback(composerNotice, 'リンクを追加しました。');
       }
       url.focus();
     })();
@@ -367,7 +408,7 @@ async function initialize() {
     }
     if (version !== loadVersion) return;
     data = loaded; editable = editing && !accessError;
-    shell = mountBinder(); renderLocation(); updateExpiry();
+    shell = mountBinder(); renderLocation(); updateExpiry(); watchMetadata(true);
     if (accessError && shell) {
       feedback(shell.notice, accessError, true);
       shell.notice.append(button('再試行', () => void initialize(), 'text-button'));

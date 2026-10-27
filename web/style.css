@@ -86,13 +86,14 @@ main { max-width: 1040px; margin: 0 auto; padding: 26px 24px 40px; }
 .node { display: grid; grid-template-columns: minmax(0, 1fr) 34px; align-items: center; min-height: 43px; border-radius: 3px; }
 .node:hover { background: var(--surface); }
 .view-only .node { grid-template-columns: minmax(0, 1fr); }
-.node-content { display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 230px); gap: 16px; min-width: 0; align-items: center; }
-.node-content:has(.node-open:only-child) { grid-template-columns: minmax(0, 1fr); }
+.node-content { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; min-width: 0; align-items: center; }
+.node-content:has(.node-domain) { padding-bottom: 6px; }
 .node-open { display: flex; align-items: center; gap: 10px; border: 0; background: transparent; text-decoration: none; padding: 9px 8px; min-width: 0; text-align: left; }
 .node-open:hover:not(:disabled) { background: transparent; }
 .node-open:hover .node-name { text-decoration: underline; text-underline-offset: 3px; }
 .node-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.node-domain { font-size: 12px; color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding-right: 12px; }
+.node-domain { font-size: 12px; color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; margin: -5px 8px 0 36px; }
+.favicon { object-fit: contain; border-radius: 2px; background: var(--surface); }
 .icon { width: 18px; height: 18px; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; color: var(--muted); }
 .icon-folder { fill: currentColor; stroke-width: .5; }
 .icon-more { stroke-width: 3; }
