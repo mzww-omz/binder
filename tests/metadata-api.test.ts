@@ -90,8 +90,15 @@ test('failed enrichment still saves a link and old rows retain manual titles and
 
 test('late jobs cannot revive deleted/expired nodes; favicon access respects expiry', async () => {
   outbound(); const b = await binder(), result = await add(b); await waitOnExecutionContext(result.ctx);
+  let release!: (response: Response) => void;
+  outbound(() => new Promise(resolve => { release = resolve; }));
+  const pending = await add(b);
+  await vi.waitFor(() => expect(release).toBeTypeOf('function'));
   const now = Date.now();
   await env.DB.prepare('UPDATE binders SET created_at=?, expires_at=? WHERE id=?').bind(now - 604800000, now, b.id).run();
+  release(new Response('<title>Expired result</title>', { headers: { 'Content-Type': 'text/html' } }));
+  await waitOnExecutionContext(pending.ctx);
+  expect(await env.DB.prepare('SELECT title, favicon FROM nodes WHERE id=?').bind(pending.node.id).first()).toEqual({ title: 'site.com', favicon: null });
   expect((await request(`/binders/${b.id}/nodes/${result.node.id}/favicon`)).response.status).toBe(404);
   expect((await request(`/binders/${b.id}`)).response.status).toBe(404);
 });

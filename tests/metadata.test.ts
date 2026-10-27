@@ -51,6 +51,14 @@ test('extracts title, decodes entities once, normalizes whitespace and resolves 
   expect(fetch.mock.calls.some(([input]) => String(input).endsWith('/favicon.ico'))).toBe(false);
 });
 
+test('uses Workers-supported manual redirects for the DNS resolver too', async () => {
+  const fetch = network({ 'https://site.com/': html('<title>Works on Workers</title>') });
+  await collectMetadata('https://site.com/', self);
+  const queries = fetch.mock.calls.filter(([input]) => String(input).startsWith('https://cloudflare-dns.com/'));
+  expect(queries).toHaveLength(2);
+  for (const [, init] of queries) expect(init?.redirect).toBe('manual');
+});
+
 test('uses /favicon.ico when no declared icon is available and ignores og:title without a title', async () => {
   const ico = Uint8Array.from([0,0,1,0,1,0,16,16,0,0,1,0,32,0,4,0,0,0,22,0,0,0,0,0,0,0]);
   network({ 'https://site.com/': html('<meta property="og:title" content="Not the page title">'),

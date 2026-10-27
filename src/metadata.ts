@@ -127,7 +127,7 @@ export async function collectMetadata(value: string, selfOrigin: string): Promis
     if (!hosts.has(host)) hosts.set(host, (async () => {
       const answers = await Promise.all(['A', 'AAAA'].map(async type => {
         const response = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=${type}`, {
-          headers: { Accept: 'application/dns-json' }, redirect: 'error', signal,
+          headers: { Accept: 'application/dns-json' }, redirect: 'manual', signal,
         });
         if (!response.ok) { void response.body?.cancel(); throw new Error('DNS unavailable'); }
         const result = JSON.parse(new TextDecoder().decode(await readBytes(response, 32768, signal))) as {
