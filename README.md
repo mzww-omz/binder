@@ -16,7 +16,7 @@ npm run dev
 
 画面は日本語表示です。操作・読み上げ用ラベル・入力検証・APIエラー・通信エラーも日本語で案内します。APIのレスポンス形式と英語エラーメッセージ自体は変更せず、フロントエンドで翻訳します。未知のエラー本文はそのまま表示せず、日本語の案内に置き換えます。日時は日本語表記で、タイムゾーンは利用端末の設定に従います。言語切り替え機能は追加していません。日本語変換中のEnterで保存せず、Escapeで編集欄を閉じないようにしています。
 
-- URLを入力欄に貼り付けてEnter。ホスト名を初期タイトルとして追加し、入力欄が空になったら続けて追加できます。外部メタデータは取得しません。
+- URLを入力欄に貼り付けてEnter。まずホスト名で即時保存し、バックグラウンドでページの `<title>` とfaviconを取得します。入力欄が空になったら続けて追加できます。取得失敗でも追加は成功します。
 - `新しいフォルダー` は一覧内に名前入力行を作ります。Enterで保存、Escapeでキャンセル。既存フォルダーの `名前を変更` も同じ行内入力です。
 - フォルダー名を押すと開き、パンくずで戻ります。ブラウザーの戻る・進むにも対応します。
 - 各行のその他メニューから `名前を変更` / `編集`（リンクのみ）/ `移動` / `削除` を選びます。右クリック、Shift+F10、コンテキストメニューキーでも同じメニューを開けます。タッチ用ボタンは常時表示します。
@@ -27,7 +27,7 @@ npm run dev
 - 保存中は操作を無効化し、失敗時は入力を保持します。フィードバックは操作場所の近くに表示し、成功表示は約3.5秒で消えます。
 - テーマは `端末に合わせる` が初期値です。`ライト` / `ダーク` も選べ、テーマのみlocalStorageへ保存します。既存のテーマ設定はそのまま引き継ぎます。
 
-閲覧・編集で共通の一覧とナビゲーションを使い、閲覧画面では作成・編集・削除操作を表示しません。Folder移動で再構築するのはパンくずと一覧だけで、タイトルやURL入力欄のDOMは保持します。保存後はAPIの応答を一覧へ反映し、全画面の再取得は行いません。API・D1スキーマ・認証・168時間の有効期限・CronはUI再設計前から変更していません。
+閲覧・編集で共通の一覧とナビゲーションを使い、閲覧画面では作成・編集・削除操作を表示しません。Folder移動で再構築するのはパンくずと一覧だけで、タイトルやURL入力欄のDOMは保持します。保存後はAPIの応答を一覧へ反映し、全画面の再構築は行いません。メタデータ取得中だけ最大6回、1秒間隔でBinderを確認し、編集・移動・選択中のUIを壊さずタイトルとfaviconを更新します。認証・168時間の有効期限・Cronの仕様は維持しています。
 
 `npm run dev` はViteでビルド後、WranglerのローカルWorkerからフロントエンドとAPIを同一オリジンで配信します。フロントエンド変更後は別ターミナルで `npm run build` を実行し、ブラウザーを再読み込みしてください。Workerの変更はWranglerが検知します。
 
@@ -37,7 +37,9 @@ npm run dev
 
 ```text
 src/
-  worker.ts                   Hono API、認証、Cron
+  worker.ts                   Hono API、認証、Cron、保存済みfaviconの配信
+  metadata.ts                 URL / DNS検証、上限付きHTML・favicon取得
+  enrichment.ts               waitUntil処理、取得予算・世代・手動タイトル保護
   types.ts                    API / UI共通のデータ型
 web/
   index.html                  ページの共通シェル
@@ -49,17 +51,49 @@ web/
 migrations/
   0001_initial.sql            テーブル、インデックス、整合性トリガー
   0002_require_link_url.sql   SQLiteのNULL評価を補う制約
+  0003_link_metadata.sql      既存データを保持してメタデータ用カラムを追加
 tests/
   setup.ts                    ローカルD1のマイグレーション適用
   api.test.ts                 実D1 / workerdでの統合テスト
   locale.test.ts              日本語エラー・残り時間の境界テスト
+  metadata.test.ts            外部HTTPを制御した取得・解析・SSRF境界テスト
+  metadata-api.test.ts        実D1での非同期取得・競合・配信テスト
+  metadata-browser.mjs        自動反映・手動編集中・アイコン失敗のUI検証
   browser.mjs                 Playwright CLI用ブラウザーフロー
 vite.config.ts
 vitest.config.ts
 wrangler.jsonc
 ```
 
-Hono以外の実行時依存はありません。React、認証サービス、外部フォント、画像、解析SDKは使用していません。`package-lock.json`をコミットし、開発ツールの間接依存undici / zodは修正版の互換メジャーへoverrideしています。
+実行時依存はHonoと `entities` のみです。HTMLRewriterは文字参照を生のまま返すため、HTML5の名前付き・数値文字参照を正しくデコードする専用ライブラリを使います。React、認証サービス、外部フォント、解析SDK、第三者faviconサービスは使用していません。`package-lock.json`をコミットし、開発ツールの間接依存undici / zodは修正版の互換メジャーへoverrideしています。
+
+## 自動メタデータ
+
+- 新規リンクのタイトルは **HTMLの `<title>` → ホスト名** の順です。`og:title` は採用しません。文字参照を一度だけデコードし、前後・連続空白を正規化して200文字以内に収めます。
+- faviconは **適切な `rel="icon"`（`shortcut icon`を含む）→ 最終ページの `/favicon.ico` → 汎用アイコン**。相対パスはリダイレクト後のページURLで解決します。候補は最大8件から16 / 32pxまたは `any` を優先し、HTML内候補を1件だけ試します。
+- PNG / ICO / SVGに対応します。Content-Typeとファイル先頭・構造を検査し、PNG（ICO内のPNGも含む）は最大512×512。SVGはスクリプト・イベント・外部参照・CSS・フィルター・XML実体等を含まない保守的なサブセットに限定します。それ以外は汎用アイコンに戻ります。
+- **追加操作は外部取得を待ちません。** `waitUntil` で取得し、UIは編集可能なままです。失敗通知を大量に出さず、ホスト名・汎用アイコンを維持します。プロセス停止等で背景処理が完了しなくてもリンクは保存済みです。次回表示時に外部取得を再実行しません。
+- 手動Renameは明示的なフラグで保護します。同じミリ秒に同じ名前へ変更した場合でも、自動取得で上書きしません。URL変更時は世代番号を更新し、旧URLの遅い結果を破棄。現在のタイトルを保持してfaviconだけを再取得します。
+- 既存リンクはマイグレーション時に「手動タイトル」として扱い、変更・一括取得しません。favicon未取得なら従来の汎用アイコンです。
+- 保存したアイコンのみを `/api/binders/:id/nodes/:nodeId/favicon?v=世代番号` から配信します。閲覧GETで外部取得しません。faviconのURLを指定できる公開プロキシも作りません。画像が読み込めなければ18pxの汎用アイコンに戻ります。
+- アイコンはD1に保存する取得キャッシュです。ブラウザーキャッシュは `private`、最大1時間、かつBinderの期限までに限定。SVGの直接表示にも `sandbox; default-src 'none'`、nosniff、同一オリジン限定のリソースポリシーを適用します。
+
+### 取得上限・ネットワーク境界
+
+| 対象 | 制限 |
+| --- | --- |
+| 1ジョブの合計時間 | DNS・HTML・画像を合わせて2.5秒 |
+| HTML | ストリームの先頭256KiBだけ読み、残りをキャンセル |
+| favicon | 32KiBまで。超過・MIME不一致は拒否 |
+| DNS応答 | 1応答32KiB、A / AAAAの両方を検証 |
+| リダイレクト | 各リソース最大2回、毎回URL / DNSを検証 |
+| 外部取得ジョブ | Binderの生存期間全体で最大400回。並行更新でも超過不可 |
+
+http / httpsの標準ポートのみを取得します。認証情報付きURL、localhost、単一ラベル・内部用ホスト名、プライベート・ループバック・リンクローカル・予約IP、IPv4埋め込み・移行用IPv6等を拒否。DNSが複数IPを返す場合は1件でも非公開アドレスがあれば取得しません。リダイレクトを自動追跡せず、外部へAuthorization・Cookie・編集URLのフラグメントを送りません。
+
+DNSチェックは接続IPを固定するものではありません。DNS rebindingを含む最終的な内部ネットワーク拒否は、[Workersの公開通信プロキシ](https://developers.cloudflare.com/workers/reference/security-model/)と明示した **`global_fetch_strictly_public`** に依存します。このフラグを削除したりVPC接続等へ置き換えたりしないでください。Wranglerローカル環境は本番のネットワーク分離を再現する保証がないため、開発サーバーを外部公開しないでください。Node等への単純移植ではこの境界が失われます。
+
+この機能のためのKV / R2 / 有料サービスは追加していません。ただし外部取得・DNS・D1書き込み・ポーリング・画像配信で無料枠を消費します。最悪1 Binderで200×32KiB（約6.25MiB）の画像領域が必要になり、DBの500MB上限に達し得ます。400回制限は濫用を抑える上限であり、全体の枠内利用や完全なbot対策を保証しません。
 
 ## DBスキーマ
 
@@ -67,8 +101,8 @@ Hono以外の実行時依存はありません。React、認証サービス、�
 
 | テーブル | カラム |
 | --- | --- |
-| `binders` | `id` PK、`title`、`edit_token_hash`、`created_at`、`expires_at`、`updated_at` |
-| `nodes` | `id` PK、`binder_id` FK、`parent_id` nullable FK、`type`、`title`、`url` nullable、`sort_order`、`created_at`、`updated_at` |
+| `binders` | `id` PK、`title`、`edit_token_hash`、`created_at`、`expires_at`、`updated_at`、`metadata_requests` |
+| `nodes` | `id` PK、`binder_id` FK、`parent_id` nullable FK、`type`、`title`、`url` nullable、`sort_order`、`created_at`、`updated_at`、`title_is_manual`、`metadata_status`、`metadata_version`、`favicon`（BLOB）、`favicon_type` |
 
 - `expires_at = created_at + 604800000` をCHECK制約で固定。
 - Binder IDは128bit、編集トークンは256bitの暗号学的乱数（hex表現）。DBにはSHA-256ハッシュのみ保存。
@@ -100,6 +134,7 @@ npx wrangler d1 migrations list binder --local
 | --- | --- | --- | --- |
 | POST | `/api/binders` | 作成。任意の `title` | 不要 |
 | GET | `/api/binders/:id` | Binderと全Node取得 | 不要 |
+| GET | `/api/binders/:id/nodes/:nodeId/favicon` | 保存済みfavicon（期限内のみ） | 不要 |
 | GET | `/api/binders/:id/access` | 編集権限の確認 | 必要 |
 | DELETE | `/api/binders/:id` | Binder全削除 | 必要 |
 | POST | `/api/binders/:id/nodes` | Folder / Link作成 | 必要 |
@@ -111,7 +146,8 @@ npx wrangler d1 migrations list binder --local
 // POST /api/binders/:id/nodes
 {"type":"folder","title":"Research","parent_id":null}
 
-// Linkにはurlが必要。Folderにはurlを指定できない
+// Linkはtitle省略で自動タイトル。title指定なら手動名を維持しfaviconだけ取得
+{"type":"link","url":"https://example.com/","parent_id":null}
 {"type":"link","title":"Documentation","url":"https://example.com/","parent_id":null}
 
 // PATCH /api/binders/:id/nodes/:nodeId（指定した項目のみ更新）
@@ -120,6 +156,8 @@ npx wrangler d1 migrations list binder --local
 // PUT /api/binders/:id/reorder（全兄弟のIDを順番通りに指定）
 {"parent_id":null,"ids":["NODE_ID_2","NODE_ID_1"]}
 ```
+
+Nodeレスポンスには `metadata_status`（none / pending / ready / failed）と `favicon_url`（未取得時null）が追加されます。アイコンのバイナリや内部フラグ・世代管理用カラムを一覧JSONに含めません。
 
 JSONのリクエストには `Content-Type: application/json`、編集リクエストには `Authorization: Bearer SECRET_TOKEN` を送ります。編集URLは `/b/ID/edit#SECRET_TOKEN`。フラグメントはHTTPリクエストやRefererには含まれません。トークンは作成時に1回だけJSONで返し、閲覧APIにはハッシュもトークンも返しません。
 
@@ -144,10 +182,11 @@ npx wrangler deploy --dry-run --outdir /tmp/binder-worker-dryrun
 
 VitestはCloudflare公式プラグインで**ローカルworkerdとD1**を動かし、実マイグレーションを適用します。DBのモックは使いません。各テスト前の消去は独立したテストDBだけが対象で、開発用 `.wrangler/state/` には触れません。
 
-日本語対応後の検証結果：
+自動メタデータ追加後の検証結果：
 
-- **40テスト成功**（D1統合20件、日本語表示20件）。D1統合テスト：作成、3階層Folder、Link作成・編集、移動、循環 / 異なるBinder / Link親の拒否、Node・配下一括・Binder削除、全更新APIのトークン検証、他Binderのトークン拒否、並び替え・不正な集合の拒否、期限直前 / ちょうど期限、期限後の各更新拒否、処理中の期限超過、Cron、期限不変、不正URL7パターン、入力制限、同時作成での上限検証など。
-- TypeScript・Viteビルド成功。バックエンド・依存パッケージの変更なし。
+- **102テスト成功**（既存API20件、日本語表示20件、メタデータ55件、メタデータD1統合7件）。D1統合テスト：作成、3階層Folder、Link作成・編集、移動、循環 / 異なるBinder / Link親の拒否、Node・配下一括・Binder削除、全更新APIのトークン検証、他Binderのトークン拒否、並び替え・不正な集合の拒否、期限直前 / ちょうど期限、期限後の各更新拒否、処理中の期限超過、Cron、期限不変、不正URL7パターン、入力制限、同時作成での上限検証など。
+- TypeScript・Viteビルド成功。外部HTTPだけをモックし、HTMLRewriter・実D1マイグレーション・背景ジョブ・画像配信は実装を通して検証。タイトル優先、文字参照、相対favicon、PNG / ICO / SVG、サイズ・時間上限、DNS / リダイレクト拒否、手動名・既存行・URL世代保護、400回予算の競合をテストしています。
+- 実際の外部取得もローカルWorkerで確認。`example.com` は保存8ms（1回の観測値、性能保証ではありません）で返り、後から `Example Domain` に更新。GitHubはページタイトルと958バイトのPNG faviconを取得し、同一オリジンの画像APIが200を返しました。検証用Binderは削除済みです。
 - `npm audit`：開発依存を含め **0 vulnerabilities**（実行時点）。
 - 既存Chromeでブラウザーフロー成功。URLだけでの連続追加、3階層Folder、行内作成・Rename、名前 / URL編集、移動、上下並べ替え、確認付き削除、XSS文字列のテキスト表示を確認。
 - 右クリック、Shift+F10、矢印・End・Escapeによるメニュー操作、戻る・進む、ナビゲーション中のヘッダー・URL入力DOM保持を検証。
@@ -164,9 +203,14 @@ VitestはCloudflare公式プラグインで**ローカルworkerdとD1**を動か
 ```sh
 PW="$HOME/.pi/agent/npm/node_modules/pi-playwright/skills/playwright-browser/scripts/pw.js"
 node "$PW" open http://localhost:8787 --browser=chrome
+node "$PW" run-code "$(node --input-type=module -e 'import { runMetadata } from "./tests/metadata-browser.mjs"; process.stdout.write(runMetadata.toString());')"
 node "$PW" run-code "$(node --input-type=module -e 'import { run } from "./tests/browser.mjs"; process.stdout.write(run.toString());')"
 node "$PW" close
 ```
+
+`metadata-browser.mjs` は制御されたAPI / 画像のfixtureで、自動タイトル反映、18px favicon、取得中の編集、手動名・既存名維持、画像404時の汎用アイコン、Light / Darkを検証します。外部サイトの内容変化に依存しません。画像は本番と同じsandbox CSPで描画確認し、画面は `/tmp/binder-metadata-light.png` と `/tmp/binder-metadata-dark.png` に保存します。外部取得の安全性・DB保存は別途Worker統合テストで検証します。
+
+既存の `browser.mjs` は回帰テスト用にホスト名を明示した手動タイトルのfixtureを使用し、そのほかの実API操作は維持します。
 
 通常の `playwright-cli` がある場合は、`node "$PW"` 部分を `playwright-cli` に置き換えてください。`tests/browser.mjs` はテスト用Binderを新規作成し、最後にそのBinderを削除します。スクリーンショットは `/tmp/binder-ja-*.png`（home / empty / desktop / nested / mobile / mobile-menu / mobile-edit / mobile-error）です。項目メニューは標準のPopover APIを使用するため、現行のChrome / Safari / Firefox等を対象とします。テスト中の想定内401 / 404 / 503はブラウザーコンソールに記録されることがありますが、未処理JavaScript例外はありません。
 
@@ -198,7 +242,7 @@ curl 'http://localhost:8787/cdn-cgi/local/scheduled?format=json'
 - 閲覧URLも秘密文書向けの認証ではありません。URLを知る誰でも閲覧できます。機密情報を置かないでください。
 - 入力をHTMLとして挿入せず `textContent` を使用。CSP、frame-ancestors、nosniff、no-referrer、Permissions-Policy、noindex、no-storeをAPIとStatic Assetsへ設定。
 - SQLの値はすべてバインド。動的なSET句はコード内の固定カラム名のみです。
-- URLはhttp / https限定。資格情報を含むURLや制御文字を拒否。外部リンクは `target="_blank" rel="noopener noreferrer"`。リンク先への自動アクセス・OGP取得は行いません。
+- URLはhttp / https限定。資格情報を含むURLや制御文字を拒否。外部リンクは `target="_blank" rel="noopener noreferrer"`。新規リンクとURL変更時のHTML / faviconのみを検証付きで自動取得します。JavaScript実行やOGP取得は行いません。
 - 他オリジンからの更新を拒否。Cookie認証やCORS許可は使いません。
 - 名前200文字、URL 2,048文字、JSONリクエスト16KiB、1 Binder 200 Node。FolderもNodeとして数えます。最大階層数もNode上限によって制限されます。
 - DBトリガーで、保持中データのうち直近1時間の作成数20件、全体2,000 Binderを上限とし、同時作成も制限。**これはサービス全体の初期運用制限**です。
@@ -268,3 +312,7 @@ npx wrangler deploy
 - [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/)
 - [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/)
 - [D1 limits](https://developers.cloudflare.com/d1/platform/limits/)
+- [HTMLRewriter](https://developers.cloudflare.com/workers/runtime-apis/html-rewriter/)
+- [Workers fetch](https://developers.cloudflare.com/workers/runtime-apis/fetch/)
+- [公開fetchの互換フラグ](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public)
+- [Workers security model](https://developers.cloudflare.com/workers/reference/security-model/)
